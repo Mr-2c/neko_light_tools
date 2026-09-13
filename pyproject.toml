@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neko-light-tools"
+version = "0.2.0"
+description = "Standalone Python mesh utilities for the Neko spectral element solver (.nmsh / .re2)"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.8"
+dependencies = ["numpy>=1.20"]
+
+[project.optional-dependencies]
+partition = ["scipy>=1.8"]
+metis = ["scipy>=1.8", "pymetis"]
+view = ["pyvista"]
+all = ["scipy>=1.8", "pymetis", "pyvista", "matplotlib"]
+
+[project.scripts]
+rea2nbin = "rea2nbin:main"
+genmeshbox = "genmeshbox:main"
+mesh_checker = "mesh_checker:main"
+prepart = "prepart:main"
+meshview = "meshview:main"
+create_periodic_zones = "create_periodic_zones:main"
+
+[tool.setuptools]
+packages = ["nekolight"]
+py-modules = ["rea2nbin", "genmeshbox", "mesh_checker", "prepart", "meshview",
+              "create_periodic_zones"]
