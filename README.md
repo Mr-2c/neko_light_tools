@@ -87,7 +87,7 @@ pyvista, `--export skin.vtu` writes a file ParaView opens directly, and
 `--matplotlib` handles small meshes (≲ 10⁴ elements) with no further
 dependencies.
 
-## Memory, honestly {#pylight-memory}
+## Memory {#pylight-memory}
 
 The whole-mesh readers hold the raw records in memory: 228 B per element
 for a `.nmsh` (so ~2.3 GB at 10⁷ elements; a fat node at 10⁸+).  The two
