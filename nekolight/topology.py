@@ -35,19 +35,29 @@
 #   /    / / _/  / ,<   / /_/ /
 #  /_/|_/ /___/ /_/|_|  \____/
 #
-"""Mesh topology: point de-duplication, periodic merges, face/edge tables,
+"""Mesh topology: point de-duplication, the periodic merge, face/edge tables,
 external surface (skin) extraction and the element dual graph.
 
-Everything is a plain function over numpy arrays.  All indices along the
-8*nelv corner axis are int64 (8 * 3e8 corners overflows int32); packed sort
-keys are uint64 (defined wrap-around).
+Everything is a plain function over numpy arrays and works for hex meshes
+(8 vertices, 6 facets) and quad meshes (4 vertices, 4 facets; a facet is an
+edge).  All indices along the nv*nelv corner axis are int64 (8 * 3e8 corners
+overflows int32); packed sort keys are uint64 (defined wrap-around).
 """
 
 import sys
 
 import numpy as np
 
-from .formats import FACE_RE2, EDGE_RE2
+from .formats import FACE_RE2, EDGE_RE2, QFACE_RE2
+
+
+def facet_table(nv):
+    """Corner slots of every facet: (6, 4) for hexes, (4, 2) for quads."""
+    if nv == 8:
+        return FACE_RE2
+    if nv == 4:
+        return QFACE_RE2
+    raise ValueError('elements must have 8 (hex) or 4 (quad) vertices')
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +69,7 @@ def pos_of_elid_map(nelv, elems):
     A valid .nmsh may store its element records in any order; the ids must be
     a permutation of 1..nelv.  Anything else is a hard error.
     """
-    elids = elems['id'].astype(np.int64)
+    elids = np.asarray(elems['id']).astype(np.int64)
     if elids.size and (elids.min() < 1 or elids.max() > nelv):
         sys.exit('Error: element id out of [1,%d]' % nelv)
     pos = np.full(nelv + 1, -1, dtype=np.int64)
@@ -75,25 +85,32 @@ def pos_of_elid_map(nelv, elems):
 # ---------------------------------------------------------------------------
 def dedup_points(xyz):
     """Assign each distinct corner coordinate a 1-based id in order of first
-    appearance, comparing float64 triples bit-exactly (matching Neko's own
-    point table, which hashes the raw bits).
+    appearance, comparing float64 triples bit-exactly.
 
-    ``xyz`` is (nelv, 8, 3) f64.  Returns (vid (nelv, 8) int32, n_unique).
+    Neko's re2 reader does the same through ``htable_pt_t``: the hash is
+    computed from the raw bits of the three coordinates, so two corners only
+    ever meet in the table when their bits agree (its equality test,
+    ``abscmp``, tolerates a few ulps, but a probe sequence reaching a
+    near-equal point stored under a different hash is a load-factor accident
+    no writer should rely on).  Bit-exact comparison is therefore what real
+    files experience.
+
+    ``xyz`` is (nelv, nv, 3) f64.  Returns (vid (nelv, nv) int32, n_unique).
 
     Memory note: this views the corners as 24-byte keys and sorts them, so
     the transient cost is roughly 45 bytes per corner (int64 indices
     included).  At 3e8 elements that is a fat-node job; below ~1e7 elements
     it is instant.
     """
-    n8 = xyz.shape[0] * 8
-    flat = np.ascontiguousarray(xyz).reshape(n8, 3)
+    nelv, nv = xyz.shape[0], xyz.shape[1]
+    flat = np.ascontiguousarray(xyz).reshape(nelv * nv, 3)
     keys = flat.view([('', 'V24')]).ravel()
     _, first, inverse = np.unique(keys, return_index=True,
                                   return_inverse=True)
     # renumber the (byte-sorted) unique keys to first-appearance order
     rank = np.empty(first.size, dtype=np.int64)
     rank[np.argsort(first, kind='stable')] = np.arange(first.size)
-    vid = (rank[inverse] + 1).reshape(-1, 8)
+    vid = (rank[inverse.ravel()] + 1).reshape(nelv, nv)
     if first.size > np.iinfo(np.int32).max:
         sys.exit('Error: more than 2^31 unique points -- the .nmsh format '
                  'stores 32-bit point ids')
@@ -101,53 +118,103 @@ def dedup_points(xyz):
 
 
 # ---------------------------------------------------------------------------
-# Periodic merges
+# The periodic merge (Neko's apply_periodic_facet, vectorised)
 # ---------------------------------------------------------------------------
-def periodic_min_merge(nelv, vidx, zones, pos_of_elid):
-    """The vectorised min-id periodic merge used by the partitioners: every
-    corner named by a periodic zone record takes ``min(own id, stored
-    glb_pt_id)``, applied over the whole set at once.
+def periodic_replace_merge(nelv, vidx, zones, pos_of_elid):
+    """Corner k of every periodic facet takes ``glb_pt_ids(k)`` directly, the
+    last record in file order winning on conflicts -- exactly what Neko's
+    reader does when it calls ``apply_periodic_facet`` for each type-5 zone
+    record.  Used by the checker AND the partitioners, so both see the
+    connectivity Neko sees.
 
-    ``vidx`` is (nelv, 8) int64 vertex ids.  Returns merged ids (same shape).
-    Zone records must already be validated (see formats.validate_zones).
+    ``vidx`` is (nelv, nv) int64 vertex ids; a corner is identified by its
+    id, so all elements sharing a point follow the point (Neko's points are
+    shared objects).  Returns merged ids (same shape).  Zone records must
+    already be validated (see formats.validate_zones).
     """
     z5 = zones[zones['t'] == 5]
     if not z5.size:
         return vidx
-    uniq = np.unique(vidx)
-    merge = uniq.copy()
+    nv = vidx.shape[1]
+    ft = facet_table(nv)
+    nc = ft.shape[1]
     pos = pos_of_elid[z5['e'].astype(np.int64)]
-    slots = FACE_RE2[z5['f'].astype(np.int64) - 1]      # (nz5, 4)
-    raw = vidx[pos[:, None], slots]
-    ridx = np.searchsorted(uniq, raw.ravel())
-    np.minimum.at(merge, ridx, z5['g'].astype(np.int64).ravel())
-    return merge[np.searchsorted(uniq, vidx.ravel())].reshape(nelv, 8)
+    slots = ft[z5['f'].astype(np.int64) - 1]                  # (nz5, nc)
+    keys = vidx[pos[:, None], slots].ravel()
+    vals = z5['g'][:, :nc].astype(np.int64).ravel()
+    # last record wins: unique on the reversed sequence keeps the LAST
+    # occurrence of each key
+    rk, first_rev = np.unique(keys[::-1], return_index=True)
+    rv = vals[::-1][first_rev]
+    flat = vidx.ravel()
+    idx = np.searchsorted(rk, flat)
+    idx[idx >= rk.size] = 0
+    hit = rk[idx] == flat
+    out = flat.copy()
+    out[hit] = rv[idx[hit]]
+    return out.reshape(vidx.shape)
 
 
-def periodic_replace_merge(nelv, vidx, zones, pos_of_elid):
-    """The checker's merge: corner k of a periodic facet takes glb_pt_ids(k)
-    directly (last record wins), exactly like Neko's apply_periodic_facet on
-    read.  Boundary-sized, so a record-order loop is the faithful (and cheap)
-    implementation."""
-    z5 = zones[zones['t'] == 5]
-    if not z5.size:
-        return vidx
-    remap = {}
-    for rec in z5:
-        pos = pos_of_elid[int(rec['e'])]
-        slots = FACE_RE2[int(rec['f']) - 1]
-        for k in range(4):
-            remap[int(vidx[pos, slots[k]])] = int(rec['g'][k])
-    keys = np.fromiter(remap.keys(), dtype=np.int64, count=len(remap))
-    vals = np.fromiter(remap.values(), dtype=np.int64, count=len(remap))
-    order = np.argsort(keys)
-    keys, vals = keys[order], vals[order]
-    idx = np.searchsorted(keys, vidx.ravel())
-    idx[idx >= keys.size] = 0
-    hit = keys[idx] == vidx.ravel()
-    out = vidx.ravel().copy()
-    out[hit] = vals[idx[hit]]
-    return out.reshape(nelv, 8)
+def create_periodic_ids(pid, vid, coords, pairs, tol, nsweeps=3, strict=True):
+    """Neko's ``mesh_create_periodic_ids``, line for line, over a fixed list
+    of (el, f, pe, pf) facet pairs (1-based element ids and facets): THREE
+    sweeps (Neko's re2 reader and create_periodic_zones both use 3), each
+    setting ``pid = min(pid_i, pid_j)`` in place for every corner of facet
+    (el, f) that matches a corner of (pe, pf) under the facet-mean
+    translation, to ``tol``.  The fixed sweep count and the in-place
+    sequential minimum are what make the resulting ids byte-identical to
+    Neko's -- do not 'improve' this into a union-find.
+
+    ``pid`` (n_points,) holds the current id of every point object (indexed
+    by the raw first-appearance id - 1) and is updated in place; ``vid``
+    (nelv, nv) are the raw corner ids, ``coords`` (n_points, 3) the point
+    coordinates.  With ``strict`` (hex meshes) anything but exactly one
+    match per corner is a hard error, as in Neko; Neko's quad branch does
+    no such check, so pass ``strict=False`` for quads -- unmatched corners
+    are then counted and returned instead.
+    """
+    ft = facet_table(vid.shape[1])
+    unmatched = 0
+    for sweep in range(nsweeps):
+        for (el, f, pe, pf) in pairs:
+            ii = vid[el - 1, ft[f - 1]].astype(np.int64)         # corner ids
+            jj = vid[pe - 1, ft[pf - 1]].astype(np.int64)
+            a = coords[ii - 1]
+            b = coords[jj - 1]
+            L = (a - b).mean(axis=0)
+            d = np.linalg.norm(a[:, None, :] - b[None, :, :] - L, axis=2)
+            for k in range(ii.size):
+                hits = np.flatnonzero(d[k] < tol)
+                if hits.size != 1:
+                    if strict:
+                        sys.exit('Error: periodic facet corner has %d matches '
+                                 '(expected 1) between element %d facet %d '
+                                 'and element %d facet %d -- malformed '
+                                 'periodic pairing' % (hits.size, el, f, pe, pf))
+                    if sweep == 0:
+                        unmatched += 1
+                for j in hits:                                   # all matches
+                    j = int(j)
+                    m = min(pid[ii[k] - 1], pid[jj[j] - 1])
+                    pid[ii[k] - 1] = m
+                    pid[jj[j] - 1] = m
+    return unmatched
+
+
+def merged_vertex_ids(mesh, pos_of_elid, extruded=False):
+    """The vertex ids Neko works with after reading ``mesh``: the periodic
+    merge applied and, for a slab built by ``formats.extrude_2d``
+    (``extruded=True``), every top point given the id of the bottom point
+    below it -- Neko marks facets 5/6 of each extruded element periodic to
+    each other and applies that AFTER the file's own zone records.
+    """
+    vidx = np.asarray(mesh.elems['v']['idx']).astype(np.int64)
+    merged = periodic_replace_merge(mesh.nelv, vidx, mesh.zones, pos_of_elid)
+    if extruded:
+        if merged is vidx:
+            merged = vidx.copy()
+        merged[:, 4:8] = merged[:, 0:4]
+    return merged
 
 
 def compress_ids(vidx):
@@ -159,28 +226,37 @@ def compress_ids(vidx):
 # ---------------------------------------------------------------------------
 # Face / edge tables (packed-key sort; shared by the checker and the skin)
 # ---------------------------------------------------------------------------
-def _pack_faces(vidx):
-    """Canonical 16-byte key per (element, facet): the sorted 4 corner ids of
-    each of the 6 facets, packed into two uint64.  Returns (6*nelv, 2)."""
-    f = vidx[:, FACE_RE2].reshape(-1, 4).astype(np.uint64)   # (6n, 4)
+def _pack_facets(vidx):
+    """Canonical key per (element, facet): the sorted corner ids of each
+    facet packed into uint64 words.  Hex faces (4 ids) become two words,
+    quad edges (2 ids) one word.  Returns (nfacets*nelv, nwords)."""
+    ft = facet_table(vidx.shape[1])
+    f = vidx[:, ft].reshape(-1, ft.shape[1]).astype(np.uint64)
     f.sort(axis=1)
-    keys = np.empty((f.shape[0], 2), dtype=np.uint64)
-    keys[:, 0] = (f[:, 0] << np.uint64(32)) | f[:, 1]
-    keys[:, 1] = (f[:, 2] << np.uint64(32)) | f[:, 3]
-    return keys
+    if ft.shape[1] == 4:
+        keys = np.empty((f.shape[0], 2), dtype=np.uint64)
+        keys[:, 0] = (f[:, 0] << np.uint64(32)) | f[:, 1]
+        keys[:, 1] = (f[:, 2] << np.uint64(32)) | f[:, 3]
+        return keys
+    return ((f[:, 0] << np.uint64(32)) | f[:, 1]).reshape(-1, 1)
 
 
 def face_multiplicity(vidx):
-    """For every (element, facet): how many times its canonical face occurs
-    in the whole mesh.  Returns (counts (nelv, 6), n_unique_faces)."""
-    keys = _pack_faces(vidx).view([('', 'V16')]).ravel()
-    _, inverse, counts = np.unique(keys, return_inverse=True,
+    """For every (element, facet): how many times its canonical facet occurs
+    in the whole mesh.  Returns (counts (nelv, nfacets), n_unique_facets)."""
+    keys = _pack_facets(vidx)
+    nf = facet_table(vidx.shape[1]).shape[0]
+    kv = keys.view([('', 'V%d' % (8 * keys.shape[1]))]).ravel()
+    _, inverse, counts = np.unique(kv, return_inverse=True,
                                    return_counts=True)
-    return counts[inverse].reshape(-1, 6), int(counts.size)
+    return counts[inverse.ravel()].reshape(-1, nf), int(counts.size)
 
 
 def count_edges(vidx):
-    """Number of unique edges (12 per element, sorted 2-tuples)."""
+    """Number of unique edges: the 12 hex edges (sorted 2-tuples) or, for
+    quads, the 4 sides (which are the facets)."""
+    if vidx.shape[1] == 4:
+        return face_multiplicity(vidx)[1]
     e = vidx[:, EDGE_RE2].reshape(-1, 2).astype(np.uint64)
     lo = np.minimum(e[:, 0], e[:, 1])
     hi = np.maximum(e[:, 0], e[:, 1])
@@ -188,8 +264,8 @@ def count_edges(vidx):
 
 
 def skin(vidx):
-    """External surface: the (element, facet) pairs whose face occurs exactly
-    once.  Returns (elem_pos (m,), facet0 (m,)) int64 arrays.
+    """External surface: the (element, facet) pairs whose facet occurs
+    exactly once.  Returns (elem_pos (m,), facet0 (m,)) int64 arrays.
 
     Use RAW (unmerged) vertex ids for viewing -- periodic boundaries are then
     part of the skin, which is what you want to look at; use merged ids to
@@ -206,14 +282,15 @@ def skin(vidx):
 def dual_graph(cell):
     """Weighted element dual graph A = E.E^T with the diagonal removed:
     A[i,j] = number of shared (merged) vertices between elements i and j.
-    ``cell`` is (nelv, 8) dense 0-based ids.  Needs scipy."""
+    ``cell`` is (nelv, nv) dense 0-based ids.  Needs scipy."""
     import scipy.sparse as sp
-    nelv = cell.shape[0]
+    nelv, nv = cell.shape
     npts = int(cell.max()) + 1
-    rows = np.repeat(np.arange(nelv, dtype=np.int64), 8)
-    E = sp.csr_matrix((np.ones(nelv * 8), (rows, cell.ravel())),
+    rows = np.repeat(np.arange(nelv, dtype=np.int64), nv)
+    E = sp.csr_matrix((np.ones(nelv * nv), (rows, cell.ravel())),
                       shape=(nelv, npts))
     A = (E @ E.T).tocsr()
     A.setdiag(0)
     A.eliminate_zeros()
+    A.sum_duplicates()
     return A

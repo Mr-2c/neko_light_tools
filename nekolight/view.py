@@ -52,6 +52,7 @@ import numpy as np
 
 from .formats import FACE_RE2, atomic_output
 from .topology import skin
+from .geometry import gll_geometry, facet_gll_mask
 
 
 class Skin:
@@ -86,6 +87,34 @@ def extract_skin(mesh, celldata_per_element=None):
         for name, arr in celldata_per_element.items():
             data[name] = np.asarray(arr)[epos]
     return Skin(points, quads, data, epos, fct)
+
+
+# the 3x3 facet nodes of each facet as a (3, 3) grid of node indices, and
+# the four sub-quads of that grid (counter-clockwise on the grid)
+_SUBQUADS = np.array([[0, 1, 4, 3], [1, 2, 5, 4], [3, 4, 7, 6], [4, 5, 8, 7]])
+
+
+def refine_skin_curved(mesh, sk, pos_of_elid):
+    """Replace every skin quad by the 2x2 sub-quads through the 9 GLL nodes
+    of its facet on Neko's curved geometry (curve records applied), so arcs
+    and midside points are visible.  Per-face data is inherited."""
+    rows, inv = np.unique(sk.elem_pos, return_inverse=True)
+    x27, _ = gll_geometry(mesh.elems['v']['xyz'], mesh.curves, pos_of_elid,
+                          rows)
+    mask = facet_gll_mask()                                # (6, 27)
+    nq = sk.quads.shape[0]
+    pts = np.empty((nq, 9, 3), dtype=np.float32)
+    for f in range(6):
+        sel = sk.facet == f
+        if not sel.any():
+            continue
+        nodes = np.flatnonzero(mask[f])                    # 9 nodes, r-fastest
+        pts[sel] = x27[inv[sel]][:, nodes, :]
+    base = (np.arange(nq) * 9)[:, None, None]
+    quads = (base + _SUBQUADS[None, :, :]).reshape(-1, 4)
+    data = {k: np.repeat(v, 4) for k, v in sk.celldata.items()}
+    return Skin(pts.reshape(-1, 3), quads, data, np.repeat(sk.elem_pos, 4),
+                np.repeat(sk.facet, 4))
 
 
 # ---------------------------------------------------------------------------

@@ -19,7 +19,12 @@ with PyVista (VTK: ParaView-grade camera, picking and clipping widgets,
   --color partition   the rank that would own each element when the file is
                       read by --nparts P ranks (Neko's linear distribution)
                       -- shows partition blocks of a prepart-ed mesh
-  --color jacobian    owner element's minimum Jacobian (straight-sided)
+  --color jacobian    owner element's minimum Jacobian (curved geometry
+                      where the file has curve records)
+
+--curved splits every skin face into 2x2 through the 9 GLL nodes of Neko's
+curved geometry, so circular arcs and midside points show.  A 2D (quad)
+file is shown as the one-element slab Neko extrudes it into.
 
 Other outputs: --export skin.vtu writes the skin for ParaView (no pyvista
 needed); --screenshot out.png renders off-screen (works headless);
@@ -31,10 +36,11 @@ import sys
 
 import numpy as np
 
-from nekolight import (banner, read_nmsh, validate_zones, validate_curves,
-                       pos_of_elid_map, min_jacobian, neko_linear_sizes)
-from nekolight.view import (extract_skin, show_pyvista, show_matplotlib,
-                            export_vtu)
+from nekolight import (banner, read_nmsh, extrude_2d, validate_zones,
+                       validate_curves, pos_of_elid_map, gll_geometry,
+                       jacobian_dets, neko_linear_sizes, CurveError)
+from nekolight.view import (extract_skin, refine_skin_curved, show_pyvista,
+                            show_matplotlib, export_vtu)
 
 
 def log(msg):
@@ -57,16 +63,22 @@ def main():
                     help='render off-screen to an image (headless-safe)')
     ap.add_argument('--matplotlib', action='store_true',
                     help='use matplotlib instead of pyvista (small meshes)')
+    ap.add_argument('--curved', action='store_true',
+                    help='show the curved geometry (2x2 sub-quads per face)')
     args = ap.parse_args()
 
     log(banner('meshview'))
     log('  reading %s ...' % args.mesh)
     mesh = read_nmsh(args.mesh)
-    validate_zones(mesh.nelv, mesh.zones, args.mesh)
-    validate_curves(mesh.nelv, mesh.curves, args.mesh)
+    validate_zones(mesh.nelv, mesh.zones, args.mesh, mesh.gdim)
+    validate_curves(mesh.nelv, mesh.curves, args.mesh, mesh.gdim, log)
     pos_of_elid = pos_of_elid_map(mesh.nelv, mesh.elems)
-    log('  %d hex elements, %d zones, %d curved elements'
-        % (mesh.nelv, mesh.zones.shape[0], mesh.curves.shape[0]))
+    log('  %d %s elements, %d zones, %d curved elements'
+        % (mesh.nelv, 'hex' if mesh.gdim == 3 else 'quad',
+           mesh.zones.shape[0], mesh.curves.shape[0]))
+    if mesh.gdim == 2:
+        log('  2D mesh: showing the one-element slab Neko extrudes it into')
+        mesh = extrude_2d(mesh)
 
     # per-element data to paint on the skin
     data = {}
@@ -83,10 +95,22 @@ def main():
         data['partition'] = np.searchsorted(bounds, np.arange(mesh.nelv),
                                             side='right').astype(np.int32)
     if args.color == 'jacobian':
-        data['jacobian'] = min_jacobian(mesh.elems['v']['xyz'])
+        try:
+            x27, _ = gll_geometry(mesh.elems['v']['xyz'], mesh.curves,
+                                  pos_of_elid, np.arange(mesh.nelv))
+        except CurveError as ex:
+            log('  warning: %s -- showing straight-sided Jacobians' % ex)
+            x27, _ = gll_geometry(mesh.elems['v']['xyz'], mesh.curves[:0],
+                                  pos_of_elid, np.arange(mesh.nelv))
+        data['jacobian'] = jacobian_dets(x27).min(axis=1)
 
     log('  extracting the external surface ...')
     sk = extract_skin(mesh, data)
+    if args.curved:
+        try:
+            sk = refine_skin_curved(mesh, sk, pos_of_elid)
+        except CurveError as ex:
+            log('  warning: %s -- showing straight-sided faces' % ex)
     # zone colouring is per (element, facet), painted after extraction
     sk.celldata['zone'] = zone_of_facet[sk.elem_pos, sk.facet]
     log('  skin: %d quads, %d points' % (sk.quads.shape[0],
