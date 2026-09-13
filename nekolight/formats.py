@@ -618,8 +618,8 @@ def read_dist_csv(path, n):
 # fld writing (single precision NEKTON/Neko field file, lx=ly=lz=3)
 # ---------------------------------------------------------------------------
 def write_zone_indices_fld(out_base, elids, gll_xyz, scal):
-    """Write ``<out_base>.fld`` (+ ``.nek5000`` companion): the straight-sided
-    trilinear geometry at the 3x3x3 GLL nodes plus one scalar field.
+    """Write ``<out_base>.fld`` (+ ``.nek5000`` companion): the given 3x3x3
+    GLL-node geometry (straight-sided or curved) plus one scalar field.
 
     ``elids`` are the ACTUAL global element ids in record order (a valid
     .nmsh may store its records in any order -- the id list is what maps a

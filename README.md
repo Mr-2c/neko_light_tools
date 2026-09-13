@@ -204,6 +204,14 @@ written in chunks.  `genmeshbox.py` streams its output and needs only the
 three 1-D grid-line arrays plus one chunk.  Curved meshes: a `.nmsh` curve
 record is 532 B per curved element.
 
+## Licence
+
+BSD-3-Clause (see `LICENSE`).  The curved-geometry construction in
+`nekolight/geometry.py` is a port of Neko routines that Neko itself
+derives from Nek5000; the Nek5000 notice reproduced in `LICENSE` applies to
+that code.  The spectral partitioner is an independent implementation of
+recursive spectral bisection and contains no Nek5000 (genmap) code.
+
 ## Scope and known differences
 
 Hex and quad meshes.  Point de-duplication is bit-exact (Neko's point table
