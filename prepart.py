@@ -46,7 +46,8 @@ the communication stays inside a node and how far apart (in rank number)
 communicating ranks are, so the effect of either option can be checked.
 
 Usage: prepart.py mesh.nmsh [nparts] [out.nmsh] [options]
-Default output is <base>_<nparts>.nmsh.
+Default output is <base>_<nparts>.nmsh; nparts and the output name may also
+come after the options (or use -o out.nmsh).
 """
 
 import argparse
@@ -84,7 +85,9 @@ def main():
     ap.add_argument('mesh', help='input .nmsh')
     ap.add_argument('rest', nargs='*', metavar='nparts [out.nmsh]',
                     help='number of partitions (implied by --grid) and the '
-                         'output .nmsh (default <base>_<nparts>.nmsh)')
+                         'output .nmsh (default <base>_<nparts>.nmsh); both '
+                         'may also follow the options')
+    ap.add_argument('-o', '--out', default=None, help='output .nmsh')
     ap.add_argument('--backend',
                     choices=('spectral', 'metis', 'geometric', 'grid'),
                     default=None)
@@ -112,13 +115,20 @@ def main():
     ap.add_argument('--low-memory', action='store_true',
                     help='memory-map the element section instead of loading '
                          'it (geometric/grid: peak memory ~ 60 B/element)')
-    args = ap.parse_args()
-    # positional: [nparts] [out]; nparts may be omitted with --grid
-    args.nparts, args.out = None, None
-    rest = list(args.rest)
+    args, extra = ap.parse_known_args()
+    # positional: [nparts] [out]; nparts may be omitted with --grid, and
+    # argparse only matches positionals before the first option, so
+    # anything left over after the options is folded in here
+    bad = [a for a in extra if a.startswith('-')]
+    if bad:
+        ap.error('unrecognised arguments: %s' % ' '.join(bad))
+    rest = list(args.rest) + list(extra)
+    args.nparts = None
     if rest and rest[0].lstrip('+-').isdigit():
         args.nparts = int(rest.pop(0))
     if rest:
+        if args.out is not None:
+            ap.error('output given twice (%s and %s)' % (args.out, rest[0]))
         args.out = rest.pop(0)
     if rest:
         ap.error('unrecognised arguments: %s' % ' '.join(rest))
@@ -204,7 +214,7 @@ def main():
         part = geometric_partition(centroids(mesh), mesh.nelv, args.nparts,
                                    args.ranks_per_node)
     else:
-        part, cuts = grid_partition(centroids(mesh), mesh.nelv, grid)
+        part, cuts = grid_partition(centroids(mesh), mesh.nelv, grid, log)
 
     want = neko_linear_sizes(mesh.nelv, args.nparts)
     if args.relabel == 'fiedler' and args.nparts > 2:

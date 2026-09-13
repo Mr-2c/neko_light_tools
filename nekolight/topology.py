@@ -206,11 +206,12 @@ def merged_vertex_ids(mesh, pos_of_elid, extruded=False):
     merge applied and, for a slab built by ``formats.extrude_2d``
     (``extruded=True``), every top point given the id of the bottom point
     below it -- Neko marks facets 5/6 of each extruded element periodic to
-    each other and applies that AFTER the file's own zone records.
+    each other and applies that AFTER the file's own zone records (and, as
+    in Neko, only when the file has a zone section at all).
     """
     vidx = np.asarray(mesh.elems['v']['idx']).astype(np.int64)
     merged = periodic_replace_merge(mesh.nelv, vidx, mesh.zones, pos_of_elid)
-    if extruded:
+    if extruded and mesh.zones.size:       # Neko does this inside nzones > 0
         if merged is vidx:
             merged = vidx.copy()
         merged[:, 4:8] = merged[:, 0:4]

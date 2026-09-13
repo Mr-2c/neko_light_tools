@@ -169,11 +169,17 @@ def _aggregate(L):
     return agg, nagg + rest.size
 
 
+class _CoarseningStalled(Exception):
+    """Aggregation could not coarsen the graph enough for a dense solve."""
+
+
 class _MultigridLaplacian:
     """Aggregation multigrid on a graph Laplacian: a symmetric V-cycle
     (weighted Jacobi smoothing, dense pseudo-inverse on the coarsest level)
     used as the LOBPCG preconditioner, plus the coarsest-level eigenvectors
-    prolonged to the fine level as the initial guess."""
+    prolonged to the fine level as the initial guess.  Raises
+    :class:`_CoarseningStalled` -- before forming any dense matrix -- when
+    aggregation stalls (e.g. a graph without edges)."""
 
     def __init__(self, L, log=_noop):
         import scipy.sparse as sp
@@ -189,6 +195,9 @@ class _MultigridLaplacian:
                               shape=(n, nagg))
             self.P.append(P)
             self.levels.append((P.T @ Lc @ P).tocsr())
+        self.n_coarse = self.levels[-1].shape[0]
+        if self.n_coarse > 4 * COARSE_N:
+            raise _CoarseningStalled(self.n_coarse)
         self.dinv = []
         for Ll in self.levels:
             d = Ll.diagonal()
@@ -201,7 +210,6 @@ class _MultigridLaplacian:
         keep = vals > 1e-10 * max(vals.max(), 1e-300)
         self.coarse_pinv = (vecs[:, keep] / vals[keep]) @ vecs[:, keep].T
         self.coarse_vals, self.coarse_vecs = vals, vecs
-        self.n_coarse = Lc.shape[0]
 
     def _cycle(self, l, r):
         L = self.levels[l]
@@ -222,10 +230,18 @@ class _MultigridLaplacian:
         return self._cycle(0, r.reshape(r.shape[0], -1)).reshape(r.shape)
 
     def initial_guess(self, k):
-        """The k lowest non-trivial coarsest eigenvectors, prolonged."""
+        """The k lowest non-trivial coarsest eigenvectors, prolonged; when
+        the coarsest level has fewer than k+1 nodes (a star collapses to one
+        aggregate) the block is completed with fixed smooth vectors."""
         X = self.coarse_vecs[:, 1:1 + k]
         for P in reversed(self.P):
             X = P @ X
+        n = X.shape[0]
+        if X.shape[1] < k:
+            t = (np.arange(n) + 0.5) / n
+            extra = [np.cos(np.pi * j * t) for j in range(1, k - X.shape[1] + 1)]
+            X = np.column_stack([X] + extra) if X.shape[1] else \
+                np.column_stack(extra)
         return X
 
 
@@ -242,11 +258,12 @@ def low_modes(subA, n, kmodes, log=_noop):
         vals, vecs = np.linalg.eigh(L.toarray())
         return vecs[:, 1:1 + k]
     from scipy.sparse.linalg import lobpcg, LinearOperator
-    mg = _MultigridLaplacian(L, log)
-    if mg.n_coarse > 4 * COARSE_N:
+    try:
+        mg = _MultigridLaplacian(L, log)
+    except _CoarseningStalled as ex:
         log('  note: multigrid coarsening stalled at %d nodes; using '
             'shift-invert Lanczos on a %d-element subset (slow)'
-            % (mg.n_coarse, n))
+            % (int(str(ex)), n))
         return _shift_invert_modes(L, n, k)
     X0 = mg.initial_guess(k)
     ones = np.ones((n, 1)) / np.sqrt(n)
@@ -403,7 +420,7 @@ def geometric_partition(cent, nelv, nparts, ranks_per_node=None):
 # ---------------------------------------------------------------------------
 # Backend: grid (user-specified NX x NY x NZ slabs at count quantiles)
 # ---------------------------------------------------------------------------
-def grid_partition(cent, nelv, grid):
+def grid_partition(cent, nelv, grid, log=_noop):
     """Cut the mesh into ``grid = (NX, NY, NZ)`` boxes by element count: NX
     slabs along x (each holding exactly the linear shares of its NY*NZ
     ranks), every slab into NY strips along y, every strip into NZ boxes
@@ -449,6 +466,17 @@ def grid_partition(cent, nelv, grid):
             boxes = split(st, 2, nz, base, 1, cut_z[ix * ny + iy])
             for iz, bx in enumerate(boxes):
                 part[bx] = base + iz
+    for name, c in (('x', cut_x), ('y', cut_y), ('z', cut_z)):
+        c = np.asarray(c).reshape(-1, c.shape[-1]) if np.asarray(c).ndim > 1 \
+            else np.asarray(c)[None, :]
+        dup = 0
+        for row in c:
+            row = row[np.isfinite(row)]
+            dup += int((np.diff(row) == 0).sum()) if row.size > 1 else 0
+        if dup:
+            log('  warning: %d repeated %s cut(s) -- more slabs than distinct '
+                'element layers along %s; those parts are disconnected'
+                % (dup, name, name))
     return part, (cut_x, cut_y, cut_z)
 
 
@@ -488,10 +516,27 @@ def _pymetis_part(Ai, nparts, tpwgts=None, recursive=False, log=_noop):
     return part
 
 
+class _MoveCounter:
+    """Collects repair_sizes' 'moved N element(s)' notes into one total."""
+
+    def __init__(self):
+        self.moved = 0
+
+    def __call__(self, msg):
+        m = msg.split('moved ')
+        if len(m) == 2:
+            self.moved += int(m[1].split()[0])
+
+    def report(self, log):
+        if self.moved:
+            log('  note: moved %d element(s) to match Neko\'s exact linear '
+                'block sizes' % self.moved)
+
+
 def _metis_level(A, idx, nparts_total, nelv, base, q, log):
     """METIS-partition the elements idx into q consecutive ranks base..base+q-1
-    with exactly their linear shares: k-way with target weights, Fiedler
-    relabelling for rank locality, then the exact-size repair."""
+    with exactly their linear shares: k-way with target weights (METIS's own
+    part numbers are kept), then the exact-size repair."""
     if q == 1:
         return np.full(idx.size, base, dtype=np.int64)
     Ai = A[idx][:, idx].tocsr()
@@ -522,13 +567,15 @@ def metis_partition(A, nelv, nparts, ranks_per_node=None, log=_noop):
     groups = -(-nparts // N)
     gsize = np.array([_share(nelv, nparts, g * N, min(N, nparts - g * N))
                       for g in range(groups)], dtype=np.int64)
+    counter = _MoveCounter()
     gpart = _pymetis_part(A, groups, gsize / gsize.sum(), log=log)
-    gpart = repair_sizes(A, gpart, gsize, log)
+    gpart = repair_sizes(A, gpart, gsize, counter)
     part = np.empty(nelv, dtype=np.int64)
     for g in range(groups):
         idx = np.flatnonzero(gpart == g)
         q = min(N, nparts - g * N)
-        part[idx] = _metis_level(A, idx, nparts, nelv, g * N, q, log)
+        part[idx] = _metis_level(A, idx, nparts, nelv, g * N, q, counter)
+    counter.report(log)
     return part
 
 
@@ -635,96 +682,78 @@ def communication_report(A, part, nparts, ranks_per_node=None):
 # ---------------------------------------------------------------------------
 def repair_sizes(A, part, target, log=_noop):
     """Move elements between parts until the part sizes exactly equal
-    ``target``.  METIS is near-balanced, so this typically moves a few
-    elements per part.  Each round computes, in one sparse product, the
-    connectivity of every element of an over-full part to every part, then
-    greedily moves the best-connected boundary elements into under-full
-    parts (never overfilling one, never moving an element twice).  An
-    over-full part with no under-full neighbour pushes its best boundary
-    element into an exactly-full neighbour instead, which then becomes the
-    over-full one next round -- excess flows along the quotient graph until
-    it reaches a deficit.  Relabelling first (largest parts onto the L+1
-    ranks) minimises the number of moves."""
+    ``target``, keeping the part NUMBERING as it is (a relabel would undo
+    the rank locality the backends work for).  METIS is near-balanced, so
+    this typically moves a few elements per part.
+
+    Excess flows along the quotient graph towards deficits: every round a
+    multi-source breadth-first search from the under-full parts gives every
+    over-full part the neighbour one hop closer to a deficit (the most
+    strongly connected such neighbour), and the part hands that neighbour
+    its excess in the form of its best-connected boundary elements -- so
+    the cut grows as little as possible and an element is never moved
+    twice.  Intermediate parts become over-full and pass the excess on next
+    round; a deficit absorbs it.  Should the flow stall (the quotient graph
+    changes as elements move), the remaining excess is moved straight into
+    under-full parts, which terminates in at most sum(excess) rounds."""
     import scipy.sparse as sp
     nparts = target.size
     part = part.copy()
-    sizes = np.bincount(part, minlength=nparts)
-    # relabel so the size ranking matches the target ranking
-    order_p = np.argsort(-sizes, kind='stable')
-    order_r = np.argsort(-target, kind='stable')
-    relabel = np.empty(nparts, dtype=np.int64)
-    relabel[order_p] = order_r
-    part = relabel[part]
-    sizes = np.bincount(part, minlength=nparts)
-    if np.array_equal(sizes, target):
-        return part
-    Ac = A.tocsr()
     n = part.size
+    Ac = A.tocsr()
     moved_flag = np.zeros(n, dtype=bool)
     moved = 0
     rounds = 0
+    stall_limit = 2 * nparts + 20
     while True:
+        sizes = np.bincount(part, minlength=nparts)
         excess = sizes - target
-        if not (excess != 0).any():
+        over = np.flatnonzero(excess > 0)
+        if over.size == 0:
             break
         rounds += 1
-        if rounds > 4 * nparts + 16:
-            sys.exit('Error: size-repair pass failed to converge (bug)')
-        over = np.flatnonzero(excess > 0)
-        cand = np.flatnonzero(np.isin(part, over) & ~moved_flag)
-        if cand.size == 0:
-            cand = np.flatnonzero(np.isin(part, over))
-            moved_flag[cand] = False
+        under = excess < 0
         O = sp.csr_matrix((np.ones(n), (np.arange(n), part)),
                           shape=(n, nparts))
-        G = (Ac[cand] @ O).tocoo()             # (n_cand, nparts) gains
-        gsrc = part[cand[G.row]]
-        keep = (G.col != gsrc)
-        gr, gc, gw = G.row[keep], G.col[keep], G.data[keep]
-        # best moves first; element index as a deterministic tie-break
-        o = np.lexsort((cand[gr], gc, -gw))
-        gr, gc, gw = gr[o], gc[o], gw[o]
-        moved_round = 0
-        # pass 1: into under-full parts
-        for r, c in zip(gr, gc):
-            e = cand[r]
-            s = part[e]
-            if excess[s] <= 0 or excess[c] >= 0 or moved_flag[e]:
+        Q = (O.T @ Ac @ O).tocsr()
+        Q.setdiag(0)
+        Q.eliminate_zeros()
+        # multi-source BFS distance to the nearest under-full part
+        dist = np.full(nparts, -1, dtype=np.int64)
+        frontier = np.flatnonzero(under)
+        dist[frontier] = 0
+        d = 0
+        while frontier.size:
+            d += 1
+            nb = np.unique(Q[frontier].indices)
+            nb = nb[dist[nb] < 0]
+            dist[nb] = d
+            frontier = nb
+        direct = rounds > stall_limit
+        for s_ in over:
+            k = int(excess[s_])
+            if k <= 0:
                 continue
-            part[e] = c
-            excess[s] -= 1
-            excess[c] += 1
-            moved_flag[e] = True
-            moved_round += 1
-        # pass 2: parts still over-full with no under-full neighbour push
-        # one element each into their best exactly-full neighbour
-        still = np.flatnonzero(excess > 0)
-        if still.size:
-            pushed = set()
-            for r, c in zip(gr, gc):
-                e = cand[r]
-                s = part[e]
-                if s in pushed or excess[s] <= 0 or excess[c] != 0 \
-                   or moved_flag[e]:
-                    continue
-                part[e] = c
-                excess[s] -= 1
-                excess[c] += 1
-                moved_flag[e] = True
-                pushed.add(s)
-                moved_round += 1
-        if moved_round == 0:
-            # no boundary candidates at all (isolated part): move arbitrary
-            # elements -- connectivity cannot be preserved here anyway
-            s = int(over[0])
-            e = int(np.flatnonzero(part == s)[0])
-            c = int(np.flatnonzero(excess < 0)[0])
-            part[e] = c
-            excess[s] -= 1
-            excess[c] += 1
-            moved_round = 1
-        moved += moved_round
-        sizes = target + excess
+            if direct or dist[s_] < 0:
+                t = int(np.flatnonzero(under)[0])          # nothing better
+            else:
+                nb = Q[s_].indices
+                w = Q[s_].data
+                ok = dist[nb] == dist[s_] - 1
+                t = int(nb[ok][np.argmax(w[ok])])
+            cand = np.flatnonzero((part == s_) & ~moved_flag)
+            if cand.size < k:
+                cand = np.flatnonzero(part == s_)
+            gains = np.asarray(Ac[cand] @ (part == t).astype(np.float64))
+            pick = cand[np.lexsort((cand, -gains))[:k]]
+            part[pick] = t
+            moved_flag[pick] = True
+            excess[s_] -= k
+            excess[t] += k
+            under = excess < 0
+            moved += k
+        if rounds > stall_limit + nparts + 8:
+            sys.exit('Error: size-repair pass failed to converge (bug)')
     if moved:
         log('  note: moved %d element(s) to match Neko\'s exact linear '
             'block sizes' % moved)

@@ -58,7 +58,7 @@ def periodic_tol():
     if not s:
         return 1e-7
     try:
-        tol = float(s)
+        tol = float(s.strip().lower().replace('d', 'e'))   # Fortran 1d-6
     except ValueError:
         sys.exit('Error: invalid NEKO_PERIODIC_TOL value: %s' % s)
     if tol <= 0.0:
@@ -74,6 +74,11 @@ def classify_bcs(nelv, bcs, gdim):
     they are counted and reported here."""
     nf = 2 * gdim
     types = [bc_type_str(t) for t in bcs['t']]
+    nnul = sum(1 for t in bcs['t'] if b'\x00' in bytes(t))
+    if nnul:
+        log('        note: %d boundary record(s) carry NUL padding in the '
+            'type field; treated as blanks here, whereas Neko\'s trim() '
+            'would leave them and skip the record' % nnul)
     e = bcs['e'].astype(np.int64)
     fc = bcs['f'].astype(np.int64)
     d1 = bcs['d'][:, 0].astype(np.float64)

@@ -142,19 +142,20 @@ def min_jacobian(corners):
 
 
 def facet_normals(xyz27):
-    """Unit normals at the centre node of facets 1..6: (m, 27, 3) ->
-    (m, 6, 3).  Orientation is not normalised (Neko's alignment test uses
-    absolute components)."""
+    """Unit OUTWARD normals (for right-handed elements, as Neko's coef%nx/
+    ny/nz) at the centre node of facets 1..6: (m, 27, 3) -> (m, 6, 3)."""
     J = jacobian_gll(xyz27)
     n = np.empty((xyz27.shape[0], 6, 3))
     for f, node in enumerate(FACET_CENTRE_NODE):
         Jf = J[:, node]                                     # (m, 3, 3)
         if f < 2:
-            v = np.cross(Jf[:, :, 1], Jf[:, :, 2])
+            v = np.cross(Jf[:, :, 1], Jf[:, :, 2])          # +r direction
         elif f < 4:
-            v = np.cross(Jf[:, :, 2], Jf[:, :, 0])
+            v = np.cross(Jf[:, :, 2], Jf[:, :, 0])          # +s
         else:
-            v = np.cross(Jf[:, :, 0], Jf[:, :, 1])
+            v = np.cross(Jf[:, :, 0], Jf[:, :, 1])          # +t
+        if f % 2 == 0:                                      # facets 1, 3, 5
+            v = -v
         nrm = np.linalg.norm(v, axis=1)
         nrm[nrm == 0.0] = 1.0
         n[:, f] = v / nrm[:, None]
@@ -277,10 +278,10 @@ def apply_curves(xyz27, corners, curves, pos_of_elid=None, rows=None):
             hs = H[isid1s - 3]                          # weight along s
             px = np.einsum('ki,j,l->klji', xcrved, hs, ht)
             py = np.einsum('ki,j,l->klji', ycrved, hs, ht)
-        g = _grid(xyz27[r]).copy()
-        g[..., 0] += px
-        g[..., 1] += py
-        xyz27[r] = g.reshape(r.size, 27, 3)
+        # add (not assign): several records may arc the same edge of one
+        # element and Neko's addtnsr accumulates them
+        np.add.at(xyz27[:, :, 0], r, px.reshape(r.size, 27))
+        np.add.at(xyz27[:, :, 1], r, py.reshape(r.size, 27))
         ndef += int(sel.sum())
     return ndef
 

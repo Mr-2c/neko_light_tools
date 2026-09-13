@@ -98,8 +98,11 @@ also follows the original numbering.
   (numpy/scipy only, no random numbers, so the output is reproducible).
   A 260k-element mesh into 256 parts takes about a minute on a laptop.
 * `metis`: multilevel k-way via pymetis, then an exact-size repair pass
-  that moves a few boundary elements to match the linear shares (the moves
-  are reported).  Usually the best cut on large meshes.
+  that moves a few boundary elements to match the linear shares: excess
+  flows along the partition quotient graph towards the nearest deficit,
+  each hop taking the best-connected boundary elements, and the part
+  numbering is left untouched (the moves are reported).  Usually the best
+  cut on large meshes.
 * `geometric`: recursive coordinate bisection on element centroids.  With
   `--no-stats` it needs neither scipy nor the vertex merge -- the numpy-only
   fast path for very large meshes (add `--low-memory` to memory-map the
@@ -153,10 +156,13 @@ the output remains a valid permutation -- only cut quality is affected.
 `mesh_checker.py mesh.nmsh [--jacobian] [--write-zone-indices]`
 
 Reports what Neko's `mesh_checker` reports for the same file: element,
-point, face and edge counts after the periodic merge (`glb_mpts` is the
-highest point id in use, as in Neko), the bounding box, periodic faces,
-labelled zones with their normal alignment (x/y/z/none, Neko's facet-centre
-test), unlabelled external faces, plus the curve records.  `--jacobian`
+point, face and edge counts (faces and edges after the periodic merge;
+"points" is Neko's `glb_mpts`, the highest point id registered while
+reading, which the merge never lowers), the bounding box of the GLL
+coordinates, periodic faces, labelled zones with their normal alignment
+(x/y/z/none, Neko's facet-centre test), unlabelled external faces, plus
+the curve records.  A curve record Neko's geometry generation would abort
+on (an arc radius below half its chord) is an error here too.  `--jacobian`
 evaluates the Jacobian on the 3×3×3 GLL grid of the geometry Neko
 constructs from the file -- the trilinear map deformed by the curve
 records (circular arcs and midside points, ports of `arc_surface` and
@@ -217,12 +223,20 @@ recursive spectral bisection and contains no Nek5000 (genmap) code.
 Hex and quad meshes.  Point de-duplication is bit-exact (Neko's point table
 hashes the raw bits, so this is what real files experience; its tolerant
 equality test only ever matters for near-coincident points that are not
-bit-identical).  Legacy zone types (1-4, pre-labelled-zone Neko) are carried
-through verbatim by the partitioner and treated as documented boundaries by
-the checker; Neko's current reader ignores them.  Neko's own
-`create_periodic_zones` indexes elements by their global id, which is only
-correct when ids equal record positions; the Python tool uses record
-positions and therefore also handles shuffled files.  All tools are
+bit-identical).  Legacy zone types (1-4, pre-labelled-zone Neko, found in
+the nekbone/poisson meshes) are carried through verbatim by the
+partitioner; Neko's current reader ignores them, so its checker -- and
+this one -- reports their external facets as unlabelled and fails, with a
+note saying why.  Two deliberate departures from `contrib/create_periodic_zones`:
+Neko's tool indexes elements by their global id, which is only correct
+when ids equal record positions (the Python tool uses record positions and
+also handles shuffled files), and it writes the read-time merged ids of the
+converted facets' corners into the element section, so that on a mesh
+whose existing periodic zones share corners with the converted ones a
+single point id ends up with two coordinates; the Python tool always keeps
+one raw id per corner (the zone records carry the merged ids, so Neko
+builds the same connectivity), and converting several pairs at once or
+one after another gives the same file.  All tools are
 validated against the meshes shipped with Neko (`run_tests.py`), but it
 remains your responsibility to confirm the result is correct for your own
 mesh -- the suite makes that easy to do on a case you trust.

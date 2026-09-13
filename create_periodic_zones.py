@@ -19,7 +19,11 @@ corners matching one-to-one under the translation).  The matched facets
 become periodic zone records (both directions), the matched corner points
 receive common ids through Neko's fixed 3-sweep min merge, and the labelled
 records of the converted zones are dropped.  Zones not mentioned and
-existing periodic zones are kept.
+existing periodic zones are kept.  Unlike Neko's tool, the element section always keeps one
+point id per physical corner (see the comment in the source), so the output
+is a valid mesh also when converted zones share corners with existing
+periodic zones, and converting pairs one at a time gives the same file as
+converting them together.
 
 The default matching tolerance is Neko's: max(1e-10, 1e-8 * max(1, bounding
 box diagonal)).  The point-id merge uses NEKO_PERIODIC_TOL (default 1e-7),
@@ -67,7 +71,7 @@ def periodic_tol():
     if not s:
         return 1e-7
     try:
-        tol = float(s)
+        tol = float(s.strip().lower().replace('d', 'e'))   # Fortran 1d-6
     except ValueError:
         sys.exit('Error: invalid NEKO_PERIODIC_TOL value: %s' % s)
     if tol <= 0.0:
@@ -178,6 +182,7 @@ def main():
         return pos, corners, corners.mean(axis=1)
 
     new_pairs = []             # (el, f, pe, pf) 1-based, both directions
+    per_pair_records = []      # the same, grouped per zone pair
     for a, b in pairs:
         za, zb = z7[z7['p_f'] == a], z7[z7['p_f'] == b]
         if za.shape[0] != zb.shape[0]:
@@ -191,36 +196,41 @@ def main():
         pb, xb, cb = facet_geometry(zb)
         offset = (cb - ca).mean(axis=0)
         match = match_facets(ca, xa, cb, xb, offset, tol)
+        recs = []
         for i in range(za.shape[0]):
             j = int(match[i])
-            new_pairs.append((int(elids[pa[i]]), int(za['f'][i]),
-                              int(elids[pb[j]]), int(zb['f'][j])))
-            new_pairs.append((int(elids[pb[j]]), int(zb['f'][j]),
-                              int(elids[pa[i]]), int(za['f'][i])))
+            recs.append((int(elids[pa[i]]), int(za['f'][i]),
+                         int(elids[pb[j]]), int(zb['f'][j])))
+            recs.append((int(elids[pb[j]]), int(zb['f'][j]),
+                         int(elids[pa[i]]), int(za['f'][i])))
+        new_pairs += recs
+        per_pair_records.append(recs)
         log('  periodic zones %d <-> %d, offset: %s (%d facet pairs)'
             % (a, b, ' '.join('%12.4e' % v for v in offset), za.shape[0]))
     log('  matching tolerance: %12.4e' % tol)
 
-    # the ids the new records store as their originals: the CURRENT ids of
-    # their corners (Neko: get_facet_ids after the read-time merge)
-    org_new = cur.copy()
-    # Neko's create_periodic_ids: 3 sweeps, (a->b, b->a) per matched pair
+    # Neko's build_periodic_pair: for EACH zone pair in turn, 3 sweeps of
+    # create_periodic_ids over its matched facets, (a->b, b->a) per match,
+    # on the current ids (the previous pairs' merges included)
     pid = cur.copy()
-    pairs_by_pos = [(int(pos_of_elid[el]) + 1, f, int(pos_of_elid[pe]) + 1, pf)
-                    for (el, f, pe, pf) in new_pairs]
-    create_periodic_ids(pid, vidx, coords, pairs_by_pos, idtol, strict=True)
+    for pa_pairs in per_pair_records:
+        by_pos = [(int(pos_of_elid[el]) + 1, f, int(pos_of_elid[pe]) + 1, pf)
+                  for (el, f, pe, pf) in pa_pairs]
+        create_periodic_ids(pid, vidx, coords, by_pos, idtol, strict=True)
 
-    # ---- write, as Neko's nmsh writer does after reset_periodic_ids ----
-    # element vertex ids: every point reset to its 'original' id -- the raw
-    # file id for the old records, the read-time merged id for the new ones
-    # (later records win, and the new ones come last)
-    write_id = np.arange(1, npt + 1, dtype=np.int64)
-    for (el, f, pe, pf) in pairs_by_pos:
-        raw = vidx[el - 1, FACE_RE2[f - 1]]
-        write_id[raw - 1] = org_new[raw - 1]
+    # ---- write ----
+    # The element section keeps the RAW file ids: one id per physical
+    # corner.  (Neko's own create_periodic_zones resets the corners of the
+    # new periodic facets to their read-time MERGED ids instead, because it
+    # stores those as the records' org_ids; on a mesh whose existing
+    # periodic zones share corners with the converted ones that makes one
+    # v_idx carry two different coordinates, and Neko's point table then
+    # gives the second element the first corner's coordinates.  The zone
+    # records below carry the fully merged glb_pt_ids either way, so Neko's
+    # mark/apply pass reconstructs the identical connectivity from raw ids
+    # -- the invariant genmeshbox and rea2nbin maintain -- and converting
+    # several pairs at once or one after the other gives the same file.)
     elems = mesh.elems.copy()
-    elems['v']['idx'] = write_id[vidx.ravel() - 1].reshape(vidx.shape) \
-        .astype(np.int32)
 
     def final_ids(el_pos, f):
         return pid[vidx[el_pos, FACE_RE2[f - 1]] - 1]

@@ -309,10 +309,11 @@ else:
     report('2D: midside curve record carried', ok)
     rc, out = tool('mesh_checker.py', 'q.nmsh', '--jacobian')
     nums = checker_numbers(out) if rc == 0 else None
-    # Neko's slab: max merged id 11; faces = 15 unique 2D edges + 6 tops;
-    # edges = 15 + 9 distinct merged points (degenerate vertical edges)
-    report('2D: checker on the slab: points 11, faces 21, edges 24',
-           rc == 0 and nums == (11, 21, 24), out[-300:])
+    # Neko's slab: glb_mpts is the largest id registered at read time, the
+    # top copy of point 12 (12 + 8*6 = 60); faces = 15 unique 2D edges + 6
+    # tops; edges = 15 + 9 distinct merged points (degenerate vertical edges)
+    report('2D: checker on the slab: points 60, faces 21, edges 24',
+           rc == 0 and nums == (60, 21, 24), out[-300:])
     write_re2_2d(wpath('q2.re2'), 3, 2, 3.0, 2.0, periodic_x=False,
                  curve=False)
     rc, out = tool('rea2nbin.py', 'q2.re2', 'q2.nmsh')
@@ -357,9 +358,9 @@ for per in ((0, 0, 0), (1, 0, 0), (0, 1, 1), (1, 1, 1)):
     Px, Py, Pz = [n if p else n + 1 for n, p in zip((nx, ny, nz), per)]
     faces = Px * ny * nz + nx * Py * nz + nx * ny * Pz
     edges = nx * Py * Pz + Px * ny * Pz + Px * Py * nz
-    # 'points' is Neko's max point id after the merge: the highest
-    # unmerged lexicographic grid node
-    points = 1 + (Px - 1) + (Py - 1) * (nx + 1) + (Pz - 1) * (nx + 1) * (ny + 1)
+    # 'points' is Neko's max_pts_id: the largest RAW point id registered
+    # when the elements are added -- the merge never lowers it
+    points = (nx + 1) * (ny + 1) * (nz + 1)
     nums = checker_numbers(out) if rc2 == 0 else None
     report('box periodic=%s: points/faces/edges %s' % (per, (points, faces,
                                                              edges)),
@@ -369,17 +370,52 @@ rc, out = tool('genmeshbox.py', 1, 0, 0, 1, 0, 1, 2, 2, 2, 'inv.nmsh')
 rc2, out2 = tool('mesh_checker.py', 'inv.nmsh', '--jacobian')
 report('inverted box (x1 < x0): checker flags negative Jacobians, exit 1',
        rc == 0 and rc2 == 1 and 'negative/zero Jacobian' in out2)
+# a legacy zone type: Neko's reader ignores the record, its checker then
+# sees an unlabelled external facet and fails -- same verdict here
+bm = read_nmsh(wpath('box_000.nmsh'))
+zl = bm.zones.copy()
+zl['t'][0] = 1
+write_nmsh(wpath('legacy.nmsh'), bm.elems, (zl,), bm.curves)
+rc, out = tool('mesh_checker.py', 'legacy.nmsh')
+report('legacy zone type -> unlabelled facet, exit 1 (as Neko)',
+       rc == 1 and 'Legacy zone records' in out
+       and 'unlabelled external faces' in out)
+# a curved element Neko refuses (arc radius below half the chord)
+from nekolight import CURVE_DT as _CDT   # noqa: E402
+cv = np.zeros(1, dtype=_CDT)
+cv['e'] = 1
+cv['type'][0, 0] = 3
+cv['data'][0, 0, 0] = 0.05
+write_nmsh(wpath('badarc.nmsh'), bm.elems, (bm.zones,), cv)
+rc, out = tool('mesh_checker.py', 'badarc.nmsh')
+report('arc radius too small: checker exits 1 without --jacobian',
+       rc == 1 and 'Radius' in out)
+# bounding box follows a midside point that bulges past the corner hull
+cv = np.zeros(1, dtype=_CDT)
+cv['e'] = 1
+cv['type'][0, 0] = 4
+cv['data'][0, 0, :3] = [0.5 / nx, -0.75, 0.0]
+write_nmsh(wpath('bulge.nmsh'), bm.elems, (bm.zones,), cv)
+rc, out = tool('mesh_checker.py', 'bulge.nmsh')
+report('bounding box includes the curved geometry (y min = -0.75)',
+       rc == 0 and re.search(r'y\s+-0\.75\s', out) is not None, out[-300:])
 
 # ---- T3: checker corpus sweep ---------------------------------------------
 print('[T3] mesh_checker: every shipped .nmsh (2D and 3D)')
 meshes = all_meshes()
-bad = []
+bad, legacy = [], []
 for f in meshes:
-    rc, _ = tool('mesh_checker.py', f)
+    rc, out = tool('mesh_checker.py', f)
     if rc != 0:
-        bad.append(f)
-report('corpus sweep (%d meshes)' % len(meshes), not bad,
-       '; '.join(bad[:3]))
+        # the nekbone/poisson meshes carry pre-labelled-zone records of
+        # type 1..4; Neko's reader ignores those, so Neko's own checker
+        # reports their facets as unlabelled and fails -- same verdict here
+        if 'Legacy zone records' in out and 'unlabelled external' in out:
+            legacy.append(f)
+        else:
+            bad.append(f)
+report('corpus sweep (%d meshes, %d with legacy zone types failing as '
+       'in Neko)' % (len(meshes), len(legacy)), not bad, '; '.join(bad[:3]))
 
 # ---- T4: prepart contract -------------------------------------------------
 print('[T4] prepart: contract on hemi (odd sizes) per backend')
@@ -404,6 +440,49 @@ for be in backends:
     same = open(wpath('h_%s.nmsh' % be), 'rb').read() == \
         open(wpath('h2_%s.nmsh' % be), 'rb').read()
     report('%s: deterministic output' % be, rc2 == 0 and same)
+
+# ---- T4a: exact-size repair must converge (METIS) --------------------------
+print('[T4a] prepart: METIS size repair on many parts / disconnected mesh')
+if HAVE_METIS:
+    rc, _ = tool('genmeshbox.py', 0, 1, 0, 1, 0, 1, 6, 6, 6, 'b666.nmsh')
+    b666 = read_nmsh(wpath('b666.nmsh'))
+    for P in (100, 50, 27):
+        rc, out = tool('prepart.py', 'b666.nmsh', P, 'b666_%d.nmsh' % P,
+                       '--metis')
+        if rc != 0:
+            report('metis 6x6x6 box P=%d: runs' % P, False, out[-300:])
+        else:
+            prepart_contract('metis 6x6x6 box P=%d' % P, b666,
+                             wpath('b666_%d.nmsh' % P), P)
+    # two disconnected boxes in one file
+    tool('genmeshbox.py', 0, 1, 0, 1, 0, 1, 4, 4, 4, 'b444.nmsh')
+    b1 = read_nmsh(wpath('b444.nmsh'))
+    e2 = b1.elems.copy()
+    e2['id'] += b1.nelv
+    e2['v']['idx'] += int(b1.elems['v']['idx'].max())
+    e2['v']['xyz'][:, :, 0] += 2.0
+    z2 = b1.zones.copy()
+    z2['e'] += b1.nelv
+    write_nmsh(wpath('two.nmsh'), np.concatenate([b1.elems, e2]),
+               (np.concatenate([b1.zones, z2]),), b1.curves)
+    two = read_nmsh(wpath('two.nmsh'))
+    for P in (29, 47):
+        rc, out = tool('prepart.py', 'two.nmsh', P, 'two_%d.nmsh' % P,
+                       '--metis')
+        if rc != 0:
+            report('metis two boxes P=%d: runs' % P, False, out[-300:])
+        else:
+            prepart_contract('metis two boxes P=%d' % P, two,
+                             wpath('two_%d.nmsh' % P), P)
+    rc, out = tool('prepart.py', 'b444.nmsh', '--metis', '13', 'after.nmsh')
+    report('nparts and output accepted after the options',
+           rc == 0 and os.path.exists(wpath('after.nmsh')), out[-200:])
+    rc, out = tool('prepart.py', 'b444.nmsh', '--grid', '2,2,2', '-o',
+                   'grid_o.nmsh')
+    report('-o output with --grid', rc == 0
+           and os.path.exists(wpath('grid_o.nmsh')), out[-200:])
+else:
+    skip('metis size repair', 'pymetis not installed')
 
 # ---- T4b: non-power-of-2 P and ranks-per-node ------------------------------
 print('[T4b] prepart: non-power-of-2 nparts, --ranks-per-node, --relabel')
@@ -546,6 +625,24 @@ report('out-of-range zone ref rejected by checker + prepart',
 rc, _ = tool('prepart.py', hemi_ref, src.nelv + 1, 'toomany.nmsh',
              '--geometric')
 report('nparts > nelv refused', rc != 0)
+# absurd record counts are refused before any allocation
+buf = bytearray(data)
+buf[off - 4:off] = np.array([2**31 - 1], dtype='<i4').tobytes()
+open(wpath('hugez.nmsh'), 'wb').write(bytes(buf))
+rc, out = tool('mesh_checker.py', 'hugez.nmsh')
+report('zone count larger than the file refused cleanly',
+       rc != 0 and 'exceeds what the file can hold' in out)
+buf = bytearray(data)
+buf[12:16] = np.array([0], dtype='<i4').tobytes()       # first vertex id 0
+open(wpath('vid0.nmsh'), 'wb').write(bytes(buf))
+rc, out = tool('mesh_checker.py', 'vid0.nmsh')
+report('vertex id 0 refused (Neko: Invalid point id)',
+       rc != 0 and 'vertex id < 1' in out)
+rc, out = tool('rea2nbin.py', hemi_re2, 'tolD.nmsh',
+               env={'NEKO_PERIODIC_TOL': '1d-7'})
+report('NEKO_PERIODIC_TOL accepts Fortran 1d-7', rc == 0)
+mode = os.stat(wpath('hemi.nmsh')).st_mode & 0o777
+report('output files get the umask mode, not 0600', mode != 0o600)
 
 # ---- T7: fld ids on a shuffled (valid) mesh --------------------------------
 print('[T7] zone-index fld: shuffled element records')
@@ -604,6 +701,23 @@ if HAVE_SCIPY:
     report('existing periodic zones kept, (3,4) added: same sizes',
            rc == 0 and rcc == 0
            and checker_numbers(outc2) == checker_numbers(outp))
+    # one-shot == sequential, and one point id per physical corner
+    rc1, _ = tool('create_periodic_zones.py', 'lab.nmsh', 's1.nmsh', '(1,2)')
+    rc2, _ = tool('create_periodic_zones.py', 's1.nmsh', 's2.nmsh', '(3,4)')
+    ok = rc1 == 0 and rc2 == 0 and open(wpath('s2.nmsh'), 'rb').read() \
+        == open(wpath('cpz.nmsh'), 'rb').read()
+    report('converting (1,2) then (3,4) == converting both at once', ok)
+
+    def aliased_ids(path):
+        m = read_nmsh(path)
+        ids = m.elems['v']['idx'].ravel()
+        xyz = m.elems['v']['xyz'].reshape(-1, 3)
+        key = xyz.view([('', 'V24')]).ravel()
+        pairs = np.unique(np.rec.fromarrays([ids, key]))
+        return int(pairs.size - np.unique(pairs.f0).size)
+    report('no vertex id carries two different coordinates',
+           aliased_ids(wpath('cpz.nmsh')) == 0
+           and aliased_ids(wpath('cpz2.nmsh')) == 0)
     rc, _ = tool('create_periodic_zones.py', 'lab.nmsh', 'bad.nmsh', '(1,3)')
     report('mismatched facet counts refused, no output',
            rc != 0 and not os.path.exists(wpath('bad.nmsh')))
@@ -718,6 +832,26 @@ except CurveError:
 report('radius smaller than the chord raises CurveError (Neko aborts)', ok)
 report('straight-sided unit cube: det J == 1 at all 27 nodes',
        np.allclose(jacobian_dets(gll_xyz(corners)), 1.0))
+# two records arcing the same edge add up (Neko's addtnsr accumulates)
+x_a = gll_xyz(corners)
+cur2 = np.zeros(2, dtype=CURVE_DT)
+cur2['e'] = 1
+cur2['type'][:, 0] = 3
+cur2['data'][0, 0, 0] = 3.0
+cur2['data'][1, 0, 0] = 5.0
+apply_curves(x_a, corners, cur2, rows=np.array([0, 0]))
+x_b = gll_xyz(corners)
+apply_curves(x_b, corners, cur2[:1], rows=np.array([0]))
+x_c = gll_xyz(corners)
+apply_curves(x_c, corners, cur2[1:], rows=np.array([0]))
+report('duplicate arc records accumulate their perturbations',
+       np.allclose(x_a - gll_xyz(corners),
+                   (x_b - gll_xyz(corners)) + (x_c - gll_xyz(corners))))
+from nekolight import facet_normals  # noqa: E402
+nrm = facet_normals(gll_xyz(corners))[0]
+report('facet normals point outward on the unit cube',
+       np.allclose(nrm, [[-1, 0, 0], [1, 0, 0], [0, -1, 0], [0, 1, 0],
+                         [0, 0, -1], [0, 0, 1]]))
 
 # ---- T10: meshview exports ------------------------------------------------
 print('[T10] meshview: .vtu export (3D, 2D slab, --curved)')

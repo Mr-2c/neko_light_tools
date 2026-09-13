@@ -103,7 +103,17 @@ def main():
         hexmesh = mesh
 
     xyz = hexmesh.elems['v']['xyz']
+    # Neko prints glmin/glmax of the GLL coordinates: the corner hull plus
+    # whatever the curved elements bulge out to
     lo, hi = xyz.reshape(-1, 3).min(axis=0), xyz.reshape(-1, 3).max(axis=0)
+    if hexmesh.curves.size:
+        crow = np.unique(pos_of_elid[hexmesh.curves['e'].astype(np.int64)])
+        try:
+            x27c, _ = gll_geometry(xyz, hexmesh.curves, pos_of_elid, crow)
+            lo = np.minimum(lo, x27c.reshape(-1, 3).min(axis=0))
+            hi = np.maximum(hi, x27c.reshape(-1, 3).max(axis=0))
+        except CurveError:
+            pass                                  # reported with the zones
 
     # ---- zones: facet marking + Neko's replace-merge ----
     log('  [2/3] applying the periodic merge and counting faces/edges ...')
@@ -111,14 +121,12 @@ def main():
     z5 = zones[zones['t'] == 5]
     z7 = zones[zones['t'] == 7]
     zleg = zones[(zones['t'] >= 1) & (zones['t'] <= 4)]
-    ftype = np.zeros((mesh.nelv, 6), dtype=np.int8)      # 0 none, 1 lbl,
-    flabel = np.zeros((mesh.nelv, 6), dtype=np.int8)     # 2 per, 3 legacy
-    if zleg.size:
-        # legacy zone types (1..4, pre-labelled-zone Neko): the current Neko
-        # reader ignores these records, but they document the boundary --
-        # count their facets as accounted for, not as unlabelled
-        ftype[pos_of_elid[zleg['e'].astype(np.int64)],
-              zleg['f'].astype(np.int64) - 1] = 3
+    ftype = np.zeros((mesh.nelv, 6), dtype=np.int8)      # 0 none, 1 lbl, 2 per
+    flabel = np.zeros((mesh.nelv, 6), dtype=np.int8)
+    # legacy zone types (1..4, pre-labelled-zone Neko): Neko's current
+    # reader has only case (5) / case (7), so it ignores these records and
+    # its checker counts their external facets as unlabelled.  Same verdict
+    # here (ftype stays 0), with the explanation printed below.
     if z5.size:
         ftype[pos_of_elid[z5['e'].astype(np.int64)],
               z5['f'].astype(np.int64) - 1] = 2
@@ -134,7 +142,13 @@ def main():
     merged = merged_vertex_ids(hexmesh, pos_of_elid, extruded=is2d)
     mult, n_faces = face_multiplicity(merged)
     n_edges = count_edges(merged)
-    n_points = int(merged.max())                        # Neko's max_pts_id
+    # Neko's glb_mpts is max_pts_id, which mesh_add_point raises for every
+    # RAW vertex id when the elements are added (for a 2D file including
+    # the extruded top ids idx + 8*nelv) and apply_periodic_facet raises
+    # further for every stored glb_pt_id -- the merge never lowers it
+    n_points = int(np.asarray(hexmesh.elems['v']['idx']).max())
+    if z5.size:
+        n_points = max(n_points, int(z5['g'].max()))
     n_unlabeled = int(((mult == 1) & (ftype == 0)).sum())
 
     # ---- report (mirrors Neko's mesh_checker) ----
@@ -156,9 +170,9 @@ def main():
     else:
         log(' Number of periodic faces: %d' % z5.shape[0])
     if zleg.size:
-        log(' Legacy zone records (types 1-4): %d (ignored by Neko\'s '
-            'current reader; their facets are treated as documented '
-            'boundaries here)' % zleg.shape[0])
+        log(' Legacy zone records (types 1-4): %d -- Neko\'s current reader '
+            'ignores them, so their external facets count as unlabelled '
+            'below' % zleg.shape[0])
     log('')
     log(' Labelled zones:')
     curves = hexmesh.curves
@@ -170,7 +184,8 @@ def main():
             try:
                 align = zone_alignment(xyz, curves, pos_of_elid, epos, f0)
             except CurveError as ex:
-                align = 'n/a (%s)' % ex
+                align = 'n/a -- %s; Neko aborts on this mesh' % ex
+                failed = True
             log('    Zone %2d: %d faces. Normal alignment: %s'
                 % (i, labeled_cnt[i], align))
 
@@ -194,40 +209,42 @@ def main():
     if do_jac:
         log('')
         log(' ------------Jacobian----------')
-        n_bad, first_bad, jac_min = 0, 0, np.inf
-        jac_min_lin = np.inf
-        ndef = 0
-        curve_err = None
         elids = np.asarray(hexmesh.elems['id'])
-        for s in range(0, mesh.nelv, CHUNK):
-            rows = np.arange(s, min(s + CHUNK, mesh.nelv))
-            try:
-                x27, nd = gll_geometry(xyz, curves, pos_of_elid, rows)
-            except CurveError as ex:
-                curve_err = str(ex)
-                x27, nd = gll_geometry(xyz, curves[:0], pos_of_elid, rows)
-            ndef += nd
-            jm = jacobian_dets(x27).min(axis=1)
-            if curves.size:
-                jac_min_lin = min(jac_min_lin, float(
-                    jacobian_dets(gll_geometry(xyz, curves[:0], pos_of_elid,
-                                               rows)[0]).min()))
-            jac_min = min(jac_min, float(jm.min()))
-            bad = np.flatnonzero(jm <= 0.0)
-            if bad.size:
-                if n_bad == 0:
-                    first_bad = int(elids[s + int(bad[0])])
-                n_bad += int(bad.size)
+
+        def scan(cv):
+            """(min J, n_bad, first bad id, n deformed edges) over all
+            elements with the curve records cv applied."""
+            n_bad, first_bad, jmin, ndef = 0, 0, np.inf, 0
+            for s in range(0, mesh.nelv, CHUNK):
+                rows = np.arange(s, min(s + CHUNK, mesh.nelv))
+                x27, nd = gll_geometry(xyz, cv, pos_of_elid, rows)
+                ndef += nd
+                jm = jacobian_dets(x27).min(axis=1)
+                jmin = min(jmin, float(jm.min()))
+                bad = np.flatnonzero(jm <= 0.0)
+                if bad.size:
+                    if n_bad == 0:
+                        first_bad = int(elids[s + int(bad[0])])
+                    n_bad += int(bad.size)
+            return jmin, n_bad, first_bad, ndef
+
+        curve_err = None
+        try:
+            jac_min, n_bad, first_bad, ndef = scan(curves)
+        except CurveError as ex:
+            curve_err = str(ex)
+            jac_min, n_bad, first_bad, ndef = scan(curves[:0])
         if curve_err:
             failed = True
             log(' Error: %s -- Neko aborts on this mesh; Jacobians below '
                 'are for the straight-sided geometry' % curve_err)
-        if curves.size:
+        elif curves.size:
+            jac_min_lin = scan(curves[:0])[0]
             log(' Min Jacobian (curved geometry, %d curved edges applied): '
                 '%14.6g' % (ndef, jac_min))
             log(' Min Jacobian (straight-sided):                       '
                 '%14.6g' % jac_min_lin)
-        else:
+        if curve_err or not curves.size:
             log(' Min Jacobian: %14.6g' % jac_min)
         if is2d:
             log(' (slab Jacobian = 0.5 x the 2D Jacobian)')

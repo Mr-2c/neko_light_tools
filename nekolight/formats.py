@@ -220,6 +220,13 @@ class atomic_output:
         d = os.path.dirname(rp) or '.'
         fd, self.tmp = tempfile.mkstemp(prefix=os.path.basename(path) + '.',
                                         suffix='.tmp', dir=d)
+        # mkstemp creates 0600; give the file the ordinary umask-based mode
+        umask = os.umask(0)
+        os.umask(umask)
+        try:
+            os.chmod(self.tmp, 0o666 & ~umask)
+        except OSError:
+            pass
         self.f = os.fdopen(fd, 'wb')
 
     def __enter__(self):
@@ -240,7 +247,7 @@ class atomic_output:
 # ---------------------------------------------------------------------------
 # nmsh read / write
 # ---------------------------------------------------------------------------
-def _count(f, what, path):
+def _count(f, what, path, itemsize=None, fsize=None):
     a = np.fromfile(f, dtype='<i4', count=1)
     if a.size != 1:
         sys.exit('Error: %s: truncated file (missing %s count)' % (path, what))
@@ -248,6 +255,11 @@ def _count(f, what, path):
     if n < 0:
         sys.exit('Error: %s: negative %s count (%d) -- corrupt file?'
                  % (path, what, n))
+    if itemsize is not None and fsize is not None \
+       and n * itemsize > fsize - f.tell():
+        sys.exit('Error: %s: %s count %d exceeds what the file can hold '
+                 '(%d bytes left) -- corrupt or mis-framed file?'
+                 % (path, what, n, fsize - f.tell()))
     return n
 
 
@@ -290,13 +302,18 @@ def read_nmsh(path, mmap=False):
         else:
             f.seek(8)
             elems = np.fromfile(f, dtype=dt, count=nelv)
+        # every vertex id must be a positive int32 (Neko: "Invalid point id")
+        for s in range(0, nelv, 1 << 20):
+            if (np.asarray(elems['v']['idx'][s:s + (1 << 20)]) < 1).any():
+                sys.exit('Error: %s: element record with a vertex id < 1 '
+                         '(Neko refuses this: "Invalid point id")' % path)
         f.seek(el_end)
-        nz = _count(f, 'zone', path)
+        nz = _count(f, 'zone', path, ZONE_DT.itemsize, fsize)
         zones = np.fromfile(f, dtype=ZONE_DT, count=nz)
         if zones.size != nz:
             sys.exit('Error: %s: truncated zone section (%d of %d records)'
                      % (path, zones.size, nz))
-        nc = _count(f, 'curve', path)
+        nc = _count(f, 'curve', path, CURVE_DT.itemsize, fsize)
         curves = np.fromfile(f, dtype=CURVE_DT, count=nc)
         if curves.size != nc:
             sys.exit('Error: %s: truncated curve section (%d of %d records)'
@@ -326,6 +343,10 @@ def extrude_2d(mesh):
         return mesh
     n = mesh.nelv
     q = mesh.elems
+    if 8 * n + int(np.asarray(q['v']['idx']).max()) > np.iinfo(np.int32).max:
+        sys.exit('Error: 2D mesh too large to extrude: the top-layer ids '
+                 'idx + 8*nelv overflow int32 (Neko aborts with "Invalid '
+                 'point id" on this mesh)')
     h = np.empty(n, dtype=EL_DT)
     h['id'] = q['id']
     h['v']['idx'][:, :4] = q['v']['idx']
@@ -429,6 +450,11 @@ def validate_zones(nelv, zones, path='', gdim=3):
         if bad.any():
             sys.exit('Error: periodic zone record references partner '
                      'element/facet out of range%s' % where)
+        nc = 4 if gdim == 3 else 2
+        if (z5['g'][:, :nc] < 1).any():
+            sys.exit('Error: periodic zone record with a point id < 1 in '
+                     'glb_pt_ids (Neko refuses this: "Invalid point id")%s'
+                     % where)
     z7 = zones[t == 7]
     if z7.size:
         lbl = z7['p_f']       # the label lives in the p_f field
@@ -520,6 +546,10 @@ def read_re2(path, chunk=1 << 21):
         del nel
         nv = 8 if ndim == 3 else 4
         rec_dt = RE2_EL_DT[v2] if ndim == 3 else RE2_EL2D_DT[v2]
+        fsize = os.fstat(f.fileno()).st_size
+        if nelv * rec_dt.itemsize > fsize - f.tell():
+            sys.exit('Error: %s: header element count %d exceeds what the '
+                     'file can hold -- corrupt header?' % (path, nelv))
 
         # elements, chunked (v1 is f32 and upcast)
         xyz = np.zeros((nelv, nv, 3), dtype=np.float64)
@@ -538,11 +568,12 @@ def read_re2(path, chunk=1 << 21):
         if not np.isfinite(xyz).all():
             sys.exit('Error: non-finite coordinate in %s' % path)
 
-        ncurve = _re2_count(f, v2, 'curve')
+        ncurve = _re2_count(f, v2, 'curve', RE2_CURVE_DT[v2].itemsize, fsize)
         curves = np.fromfile(f, dtype=RE2_CURVE_DT[v2], count=ncurve)
         if curves.size != ncurve:
             sys.exit('Error: truncated or corrupt .re2 file (curve section)')
-        nbc = _re2_count(f, v2, 'boundary-condition')
+        nbc = _re2_count(f, v2, 'boundary-condition', RE2_BC_DT[v2].itemsize,
+                         fsize)
         bcs = np.fromfile(f, dtype=RE2_BC_DT[v2], count=nbc)
         if bcs.size != nbc:
             sys.exit('Error: truncated or corrupt .re2 file (BC section)')
@@ -564,7 +595,7 @@ def read_re2(path, chunk=1 << 21):
     return Re2(nelv, ver, xyz, curves, bcs, ndim)
 
 
-def _re2_count(f, v2, what):
+def _re2_count(f, v2, what, itemsize, fsize):
     if v2:
         a = np.fromfile(f, dtype='<f8', count=1)
     else:
@@ -572,9 +603,14 @@ def _re2_count(f, v2, what):
     if a.size != 1:
         sys.exit('Error: truncated or corrupt .re2 file (missing %s count)'
                  % what)
+    if not np.isfinite(a[0]):
+        sys.exit('Error: corrupt %s count in .re2' % what)
     n = int(a[0])
     if n < 0:
         sys.exit('Error: negative %s count in .re2' % what)
+    if n * itemsize > fsize - f.tell():
+        sys.exit('Error: %s count %d exceeds what the .re2 file can hold '
+                 '-- corrupt or mis-framed file?' % (what, n))
     return n
 
 
