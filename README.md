@@ -7,11 +7,11 @@
 
 # Neko light tools
 
-Standalone, CPU-only mesh utilities for [Neko](https://github.com/ExtremeFLOW/neko),
-in scientific Python.  They reproduce the mesh tools shipped under Neko's
-`contrib/` -- byte-exact where a Neko-written reference exists -- without
-a Neko build, MPI or a Fortran compiler: `python3` with numpy is the only
-hard requirement (scipy for partitioning and periodic-zone creation).
+CPU-only mesh utilities for Neko in scientific Python, meant to live under
+Neko's `contrib/`.  They reproduce the mesh tools built from the Fortran
+sources next to them -- byte-exact where a Neko-written reference exists --
+without a Neko build, MPI or a Fortran compiler: `python3` with numpy is the
+only hard requirement (scipy for partitioning and periodic-zone creation).
 One shared library (`nekolight/`) holds every byte layout, topology table
 and algorithm exactly once; six thin command-line tools sit on top of it.
 
@@ -28,13 +28,13 @@ All tools accept 2D (quad) as well as 3D (hex) meshes, exactly as Neko
 does: a 2D file is partitioned and written as quads, and checked/viewed as
 the one-element-thick slab Neko's reader extrudes it into.
 
-Install nothing: run the scripts from a checkout (`python3 prepart.py ...`),
-or `pip install .` to get them on your `PATH` (`pip install '.[all]'` adds
-the optional extras).
+Nothing to install: run the scripts in place (`python3 prepart.py ...`);
+the optional extras are `pip install scipy pymetis pyvista matplotlib`.
 
 ## Validation
 
 ```
+python3 run_tests.py            # from inside the Neko checkout
 python3 run_tests.py /path/to/neko
 ```
 
@@ -212,11 +212,12 @@ record is 532 B per curved element.
 
 ## Licence
 
-BSD-3-Clause (see `LICENSE`).  The curved-geometry construction in
-`nekolight/geometry.py` is a port of Neko routines that Neko itself
-derives from Nek5000; the Nek5000 notice reproduced in `LICENSE` applies to
-that code.  The spectral partitioner is an independent implementation of
-recursive spectral bisection and contains no Nek5000 (genmap) code.
+Part of Neko: the terms in Neko's `COPYING` apply.  The curved-geometry
+construction in `nekolight/geometry.py` is a port of Neko routines that
+Neko itself derives from Nek5000, so the Nek5000 notice reproduced in
+`COPYING` applies to that code.  The spectral partitioner is an independent
+implementation of recursive spectral bisection and contains no Nek5000
+(genmap) code.
 
 ## Scope and known differences
 

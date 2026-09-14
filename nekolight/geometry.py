@@ -4,7 +4,7 @@
 # The curved-geometry construction in this module (apply_curves and its
 # helpers) is a port of Neko's dofmap_xyzquad / gh_face_extend_3d /
 # arc_surface, which Neko derives from Nek5000 (Copyright (c) 2008-2020,
-# UCHICAGO ARGONNE, LLC); the Nek5000 terms in the LICENSE file apply to it.
+# UCHICAGO ARGONNE, LLC); the Nek5000 terms in Neko's COPYING apply to it.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions

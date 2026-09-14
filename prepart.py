@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026, The Neko Authors
 # All rights reserved.  BSD-3-Clause: see nekolight/formats.py for the full
-# licence text.
+# licence text (part of Neko; see also Neko's COPYING).
 #
 #     _  __  ____  __ __  ____
 #    / |/ / / __/ / //_/ / __ \

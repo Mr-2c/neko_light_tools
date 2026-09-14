@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026, The Neko Authors
 # All rights reserved.  BSD-3-Clause: see nekolight/formats.py for the full
-# licence text.
+# licence text (part of Neko; see also Neko's COPYING).
 #
 #     _  __  ____  __ __  ____
 #    / |/ / / __/ / //_/ / __ \
@@ -14,8 +14,9 @@
 
 The Neko checkout supplies the golden files (examples/hemi/hemi.re2 with the
 hemi.nmsh Neko's rea2nbin wrote from it, the shipped box meshes) and the
-mesh corpus; it defaults to $NEKO_DIR, then a sibling or parent ``neko``
-directory.  Work files go to a temporary directory.  Principles:
+mesh corpus; it defaults to $NEKO_DIR, then the checkout this directory
+lives in (contrib/<tools>/../..), then a sibling ``neko`` directory.  Work
+files go to a temporary directory.  Principles:
 
   * oracles are Neko's own source (datadist.f90's block formula, the
     closed-form point/face/edge counts of a box, the .re2 layout written by
