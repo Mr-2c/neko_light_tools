@@ -30,6 +30,10 @@ from .topology import (facet_table, pos_of_elid_map, dedup_points,
 from .geometry import (gll_xyz, jacobian_gll, jacobian_dets, min_jacobian,
                        facet_normals, facet_gll_mask, apply_curves,
                        gll_geometry, CurveError, GLL3)
+from .gmsh import read_msh, GmshMesh, GMSH_TYPES
+from .gmshconv import (CellSet, FacetTable, UnionFind, boundary_cells,
+                       corner_jacobians, orient, CURVE_TOL)
+from .extrude import layer_planes, extrude
 from .partition import (neko_linear_sizes, spectral_partition,
                         metis_partition, geometric_partition, grid_partition,
                         repair_sizes, weighted_cut, quotient_graph,

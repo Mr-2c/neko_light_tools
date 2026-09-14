@@ -13,7 +13,7 @@ sources next to them -- byte-exact where a Neko-written reference exists --
 without a Neko build, MPI or a Fortran compiler: `python3` with numpy is the
 only hard requirement (scipy for partitioning and periodic-zone creation).
 One shared library (`nekolight/`) holds every byte layout, topology table
-and algorithm exactly once; six thin command-line tools sit on top of it.
+and algorithm exactly once; seven thin command-line tools sit on top of it.
 
 | Tool | What it does | Needs |
 |---|---|---|
@@ -22,6 +22,7 @@ and algorithm exactly once; six thin command-line tools sit on top of it.
 | `mesh_checker.py` | `.nmsh` validation and diagnostics as `contrib/mesh_checker` reports them: sizes after the periodic merge, zones with normal alignment, unlabelled external faces, curve records, `--jacobian` on Neko's curved geometry, `--write-zone-indices` | numpy |
 | `prepart.py` | Mesh partitioner (spectral / METIS / geometric / grid) writing a reordered `.nmsh` whose linear read reproduces the partition exactly | numpy + scipy (optional: pymetis) |
 | `create_periodic_zones.py` | Turn pairs of labelled zones into periodic zones, as `contrib/create_periodic_zones` | numpy + scipy |
+| `gmsh2nmsh.py` | Gmsh `.msh` (2.2/4.1, ASCII/binary; hex or quad, first or second order) → `.nmsh`: `contrib/gmsh2nek` and Nek5000's `n2to3` in one step -- physical groups to labelled zones, `$Periodic` to periodic zones, mid-edge nodes to midside curves, optional extrusion of a 2D mesh into hexahedral layers with periodic or labelled z-faces | numpy (scipy for periodic matching) |
 | `meshview.py` | Interactive mesh viewer: external-surface extraction + PyVista, `.vtu` export for ParaView, matplotlib fallback, `--curved` | numpy (optional: pyvista, matplotlib) |
 
 All tools accept 2D (quad) as well as 3D (hex) meshes, exactly as Neko
@@ -194,6 +195,67 @@ verified corner by corner).  The matched facets become periodic records,
 the matched points get common ids through Neko's 3-sweep merge, existing
 zones are kept.  The default tolerance and the two-tolerance scheme (facet
 matching vs. `NEKO_PERIODIC_TOL` for the id merge) are Neko's.
+
+## Gmsh meshes
+
+`gmsh2nmsh.py in.msh out.nmsh [--extrude Z0 Z1 NLAYERS [--gain G] | --zfile FILE]
+[--zbc periodic | --zbc BOTTOM TOP] [--periodic A:B ...] [--label OLD=NEW ...]
+[--untagged LABEL] [--no-msh-periodic] [--tol X]`
+
+Reads Gmsh's `.msh` format 2.2 or 4.1, ASCII or binary, and writes a Neko
+mesh directly.  It is `contrib/gmsh2nek` (Nek5000's converter, which needs
+format 2.x, second-order cells and a `.re2` round trip) and Nek5000's
+`n2to3` (extrusion of a 2D mesh) written against Neko's format, with the
+same conventions:
+
+* **Cells.**  Hexahedra with 8, 20 or 27 nodes, or quadrilaterals with 4,
+  8 or 9 nodes; Gmsh's corner order is Nek's cyclic vertex order, so
+  corners map one-to-one.  A left-handed cell is mirrored (gmsh2nek does
+  this for quads only).  Tets, prisms, pyramids and triangles are refused:
+  Neko needs an all-hex or all-quad mesh (Gmsh: `Recombine`,
+  `Mesh.RecombineAll`, transfinite or extruded meshing).
+* **Curvature.**  Mid-edge nodes of second-order cells become midside-point
+  curves when they leave the chord by more than 1e-4 of its length (the
+  gmsh2nek test); face-centre and volume-centre nodes are dropped, since a
+  `.nmsh` cannot store them and Neko rebuilds them with its Gordon-Hall
+  blend.  hex20 and hex27 versions of the same mesh give identical files.
+* **Boundaries.**  Every boundary facet must belong to a physical group
+  (surfaces in 3D, curves in 2D); the physical tag becomes the Neko label
+  (1..20; `--label outlet=3` or `--label 7=3` renames).  Facets are matched
+  by node-id set, as gmsh2nek does.  Remember that Gmsh saves only entities
+  in physical groups unless `Mesh.SaveAll` is set; untagged boundary facets
+  are an error unless `--untagged LABEL` gives them a label.  Tagged
+  interior facets are ignored with a warning.
+* **Periodicity.**  The file's `$Periodic` links (from `Periodic Surface`
+  / `setPeriodic`) supply the translations; the facets are then paired
+  geometrically, like `create_periodic_zones.py`, because Gmsh splits the
+  node correspondences over the surface and its bounding curves.  Only
+  translations are accepted (Neko has no rotational periodicity).
+  `--periodic A:B` pairs two labelled zones by translation instead or in
+  addition.  Periodic facets lose their label.  The matched points get
+  common ids (union-find, smallest id), and the tool verifies that Neko's
+  record-replacement semantics reproduce every correspondence.
+* **2D meshes.**  Without `--extrude` a quad mesh is written as a 2D
+  `.nmsh`, which Neko extrudes to one layer at run time.  With
+  `--extrude Z0 Z1 NLAYERS` (uniform, or geometric with `--gain G`: layer
+  `k` is proportional to `G**k`, as n2to3) or `--zfile FILE` (the
+  `NLAYERS+1` ascending plane coordinates) it becomes a 3D mesh: layer `k`
+  of 2D element `e` is element `e + k*nel2d`, quad corners 1-4 sit at the
+  lower plane and 5-8 at the upper one, 2D facets 1-4 become hex facets
+  1-4 with their labels and periodicity on every layer, midside curves go
+  to the bottom and top edges of each layer, and the new faces are either
+  periodic across the stack (`--zbc periodic`, any number of layers) or
+  labelled (`--zbc BOTTOM TOP`).  n2to3's circular sweep and its
+  conjugate-heat-transfer (solid element) handling are not implemented.
+* **Checks.**  The output must pass what `mesh_checker.py --jacobian`
+  checks (zone and curve validity, positive corner Jacobians, positive GLL
+  Jacobians of the curved geometry); otherwise nothing is written.  The
+  report lists every label with its physical name and facet count, every
+  periodic pairing with its translation, and the curved-geometry Jacobian
+  minimum.
+
+Test fixtures generated with the Gmsh Python API are in `tests/gmsh/`
+(`generate.py` recreates them).
 
 ## Memory
 

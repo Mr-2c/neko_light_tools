@@ -911,6 +911,225 @@ for name, path, extra in (('hemi', hemi_ref, []),
         ok = 'NumberOfCells' in txt
     report('meshview %s: skin export' % name, ok, out[-200:])
 
+# ---- T11: gmsh2nmsh ---------------------------------------------------------
+print('[T11] gmsh2nmsh: Gmsh .msh -> .nmsh (formats, orientation, curves, '
+      'zones, periodicity, extrusion)')
+from nekolight import (read_msh, merged_vertex_ids, pos_of_elid_map,   # noqa
+                       dual_graph, extrude_2d, FACE_RE2, layer_planes)
+GM = os.path.join(HERE, 'tests', 'gmsh')
+
+
+def gconv(msh, out, *extra):
+    return tool('gmsh2nmsh.py', os.path.join(GM, msh), wpath(out), *extra)
+
+
+def checker(path, *extra):
+    rc, out = tool('mesh_checker.py', wpath(path), *extra)
+    return rc == 0 and 'Done' in out, out
+
+
+def label_counts(out):
+    return {int(a): int(b) for a, b in
+            re.findall(r'label\s+(\d+) :\s+(\d+) facets', out)}
+
+
+def connectivity(path):
+    """(unique merged points, sorted dual-graph degrees, periodic facets,
+    {label: sorted facet centres}) of a .nmsh after Neko's periodic merge."""
+    m = read_nmsh(wpath(path))
+    pos = pos_of_elid_map(m.nelv, m.elems)
+    ext = m.gdim == 2
+    mm = extrude_2d(m) if ext else m
+    merged = merged_vertex_ids(mm, pos, extruded=ext)
+    A = dual_graph(merged)
+    deg = np.sort(np.diff(A.indptr)) if hasattr(A, 'indptr') else None
+    xyz = mm.elems['v']['xyz']
+    cent = {}
+    z7 = m.zones[m.zones['t'] == 7]
+    for lb in np.unique(z7['p_f']):
+        r = z7[z7['p_f'] == lb]
+        slots = FACE_RE2[r['f'].astype(np.int64) - 1] if not ext else \
+            FACE_RE2[r['f'].astype(np.int64) - 1]
+        c = xyz[pos[r['e'].astype(np.int64)][:, None], slots].mean(axis=1)
+        cent[int(lb)] = np.round(np.sort(c, axis=0), 9)
+    return int(np.unique(merged).size), deg, int((m.zones['t'] == 5).sum()), cent
+
+
+# 1. the four format variants of the same box give one file
+outs = []
+for v in ('v22a', 'v22b', 'v41a', 'v41b'):
+    rc, out = gconv('box8_%s.msh' % v, 'gbox_%s.nmsh' % v)
+    outs.append((rc, out))
+ok_all = all(rc == 0 for rc, _ in outs)
+
+
+def same_mesh(a, b, rtol=1e-12):
+    """Same records up to the last bits of the coordinates (Gmsh writes 16
+    significant digits in ASCII files, exact doubles in binary ones)."""
+    A, B = read_nmsh(wpath(a)), read_nmsh(wpath(b))
+    return A.nelv == B.nelv and np.array_equal(A.elems['id'], B.elems['id']) \
+        and np.array_equal(A.elems['v']['idx'], B.elems['v']['idx']) \
+        and np.allclose(A.elems['v']['xyz'], B.elems['v']['xyz'], rtol=rtol, atol=1e-13) \
+        and np.array_equal(A.zones, B.zones) and A.curves.shape == B.curves.shape \
+        and np.array_equal(A.curves['e'], B.curves['e']) \
+        and np.array_equal(A.curves['type'], B.curves['type']) \
+        and np.allclose(A.curves['data'], B.curves['data'], rtol=rtol, atol=1e-13)
+
+
+same = ok_all and open(wpath('gbox_v22a.nmsh'), 'rb').read() == \
+    open(wpath('gbox_v41a.nmsh'), 'rb').read() and \
+    all(same_mesh('gbox_%s.nmsh' % v, 'gbox_v41a.nmsh') for v in ('v22b', 'v41b'))
+report('gmsh2nmsh: msh 2.2/4.1 ASCII/binary give the same mesh (ASCII '
+       'byte-identical, binary to the last bit)', same,
+       ''.join(o[-300:] for _, o in outs if _ != 0))
+ok, cout = checker('gbox_v41a.nmsh', '--jacobian')
+lc = label_counts(outs[2][1])
+report('gmsh2nmsh: box passes the checker with labels 1..6 x 9 facets',
+       ok and lc == {i: 9 for i in range(1, 7)}, cout[-300:] + str(lc))
+# 2. the same box from genmeshbox: identical connectivity and zone geometry
+rc, gout = tool('genmeshbox.py', 0, 3, 0, 2, 0, 1, 3, 3, 3, wpath('genbox.nmsh'))
+if rc == 0:
+    a = connectivity('gbox_v41a.nmsh'); b = connectivity('genbox.nmsh')
+    ok = a[0] == b[0] == 64 and np.array_equal(a[1], b[1]) and \
+        set(a[3]) == set(b[3]) and all(np.allclose(a[3][k], b[3][k]) for k in a[3])
+    report('gmsh2nmsh: box equals genmeshbox (points, dual graph, zone '
+           'facet centres)', ok, '%s vs %s' % (a[:3], b[:3]))
+else:
+    skip('gmsh2nmsh vs genmeshbox', 'genmeshbox failed: ' + gout[-100:])
+# 3. periodic box: $Periodic (x and z) == genmeshbox periodic == --periodic pairs
+rc1, o1 = gconv('boxper8_v41a.msh', 'gboxper.nmsh')
+rc2, o2 = gconv('boxper27_v22b.msh', 'gboxper27.nmsh')
+rc3, o3 = gconv('box8_v41a.msh', 'gboxlab.nmsh', '--periodic', '1:2', '--periodic', '5:6')
+rc4, o4 = tool('genmeshbox.py', 0, 3, 0, 2, 0, 1, 3, 3, 3, '.true.', '.false.',
+               '.true.', wpath('genboxper.nmsh'))
+if rc1 == 0 and rc2 == 0 and rc3 == 0 and rc4 == 0:
+    c = [connectivity(p) for p in ('gboxper.nmsh', 'gboxper27.nmsh', 'gboxlab.nmsh',
+                                  'genboxper.nmsh')]
+    ok = all(x[0] == 36 and x[2] == 36 and np.array_equal(x[1], c[0][1]) for x in c)
+    ok = ok and all(set(x[3]) == {3, 4} and np.allclose(x[3][3], c[0][3][3])
+                    and np.allclose(x[3][4], c[0][3][4]) for x in c)
+    report('gmsh2nmsh: periodic box ($Periodic, hex27 2.2-binary, --periodic '
+           'pairs) equals genmeshbox px,pz', ok, str([x[:3] for x in c]))
+    ok, cout = checker('gboxper.nmsh', '--jacobian')
+    report('gmsh2nmsh: periodic box passes the checker', ok, cout[-300:])
+else:
+    report('gmsh2nmsh: periodic box conversions run', False,
+           (o1 + o2 + o3 + o4)[-400:])
+# 4. curved annulus: hex27 and hex20 identical; extruded 2D quad9 equals the
+#    Gmsh-extruded 3D mesh (points, curved edges, zone geometry, Jacobians)
+rc1, o1 = gconv('annulus3d_h27_v41b.msh', 'ann27.nmsh')
+rc2, o2 = gconv('annulus3d_h20_v41a.msh', 'ann20.nmsh')
+rc3, o3 = gconv('annulus2d_q9_v22a.msh', 'ann2dx.nmsh', '--extrude', 0, 0.5, 2,
+                '--zbc', 5, 6)
+rc4, o4 = gconv('annulus3d_h8_v41a.msh', 'ann8.nmsh')
+ok = rc1 == 0 and rc2 == 0 and same_mesh('ann27.nmsh', 'ann20.nmsh', rtol=1e-9)
+report('gmsh2nmsh: hex27 and hex20 versions give the same mesh', ok,
+       (o1 + o2)[-300:])
+if rc1 == 0 and rc3 == 0 and rc4 == 0:
+    ok27, c27 = checker('ann27.nmsh', '--jacobian')
+    okx, cx = checker('ann2dx.nmsh', '--jacobian')
+    ok8, c8 = checker('ann8.nmsh', '--jacobian')
+    jac = lambda out: float(re.search(r'curved geometry.*?:\s+([-0-9.eE+]+)', out).group(1))
+    a, b = connectivity('ann27.nmsh'), connectivity('ann2dx.nmsh')
+    ok = ok27 and okx and ok8 and a[0] == b[0] == 72 and np.array_equal(a[1], b[1]) \
+        and set(a[3]) == set(b[3]) and all(np.allclose(a[3][k], b[3][k]) for k in a[3]) \
+        and abs(jac(c27) - jac(cx)) < 1e-12 and 'Curved elements: 20' in c27 \
+        and 'Curved elements: 20' in cx and '40 midside' in cx
+    report('gmsh2nmsh: extruded 2D quad9 == Gmsh-extruded hex27 (geometry, '
+           'zones, curved Jacobian)', ok, (c27 + cx)[-400:])
+    ok = 'Min Jacobian (curved' in c27 and jac(c27) < float(
+        re.search(r'straight-sided\):\s+([-0-9.eE+]+)', c27).group(1))
+    report('gmsh2nmsh: midside curves are applied (curved Jacobian differs '
+           'from straight)', ok, c27[-300:])
+else:
+    report('gmsh2nmsh: annulus conversions run', False, (o1 + o3 + o4)[-400:])
+# 5. 2D output: Neko's own one-layer extrusion of the 2D file equals
+#    --extrude with one periodic layer
+rc1, o1 = gconv('rect2d_per_q4_v41a.msh', 'rect2d.nmsh')
+rc2, o2 = gconv('rect2d_per_q4_v41a.msh', 'rect3d1.nmsh', '--extrude', 0, 1, 1,
+                '--zbc', 'periodic')
+if rc1 == 0 and rc2 == 0:
+    m2 = read_nmsh(wpath('rect2d.nmsh'))
+    a, b = connectivity('rect2d.nmsh'), connectivity('rect3d1.nmsh')
+    ok = m2.gdim == 2 and a[0] == b[0] == 12 and np.array_equal(a[1], b[1]) \
+        and a[2] == 4 and b[2] == 4 + 16 and set(a[3]) == set(b[3]) == {3, 4}
+    report('gmsh2nmsh: 2D file (Neko slab) == one periodic extruded layer',
+           ok, '%s %s' % (a[:3], b[:3]))
+    ok2, c2 = checker('rect2d.nmsh')
+    report('gmsh2nmsh: 2D periodic rectangle passes the checker',
+           ok2 and 'periodic faces: 4' in c2, c2[-300:])
+else:
+    report('gmsh2nmsh: 2D conversions run', False, (o1 + o2)[-400:])
+# 6. layer distributions and labelled z-faces
+rc, out = gconv('rect2d_per_q9_v41a.msh', 'rect3d.nmsh', '--extrude', 0, 2, 3,
+                '--gain', 2, '--zbc', 5, 6, '--no-msh-periodic', '--periodic', '1:2')
+if rc == 0:
+    m3 = read_nmsh(wpath('rect3d.nmsh'))
+    z = np.unique(np.round(m3.elems['v']['xyz'][:, :, 2], 12))
+    ok = np.allclose(z, layer_planes(0, 2, 3, 2.0)) and m3.nelv == 24 and \
+        label_counts(out) == {3: 12, 4: 12, 5: 8, 6: 8} and \
+        (m3.zones['t'] == 5).sum() == 12 and \
+        np.array_equal(m3.elems['id'], np.arange(1, 25))
+    okc, cout = checker('rect3d.nmsh', '--jacobian')
+    report('gmsh2nmsh: --gain planes, labelled z-faces, --periodic per layer',
+           ok and okc, out[-300:] + cout[-200:])
+else:
+    report('gmsh2nmsh: --gain extrusion runs', False, out[-400:])
+with open(wpath('planes.txt'), 'w') as f:
+    f.write('0\n0.1\n0.3\n0.6\n1\n')
+rc, out = gconv('rect2d_per_q4_v41a.msh', 'rectz.nmsh', '--zfile', wpath('planes.txt'),
+                '--zbc', 'periodic')
+if rc == 0:
+    m3 = read_nmsh(wpath('rectz.nmsh'))
+    z = np.unique(np.round(m3.elems['v']['xyz'][:, :, 2], 12))
+    c = connectivity('rectz.nmsh')
+    report('gmsh2nmsh: --zfile planes and periodic z with lateral periodicity',
+           np.allclose(z, [0, 0.1, 0.3, 0.6, 1]) and c[0] == 12 * 4 and
+           c[2] == 2 * (2 * 4 + 8), str(c[:3]))
+else:
+    report('gmsh2nmsh: --zfile extrusion runs', False, out[-400:])
+# 7. error paths
+rc, out = gconv('box8_untagged_v41a.msh', 'bu.nmsh')
+report('gmsh2nmsh: untagged boundary facets are refused',
+       rc != 0 and 'no physical group' in out and not os.path.exists(wpath('bu.nmsh')),
+       out[-300:])
+rc, out = gconv('box8_untagged_v41a.msh', 'bu.nmsh', '--untagged', 6)
+report('gmsh2nmsh: --untagged labels them', rc == 0 and label_counts(out).get(6) == 9,
+       out[-300:])
+rc, out = gconv('tets_v41a.msh', 't.nmsh')
+report('gmsh2nmsh: a tet mesh is refused with the cell types named',
+       rc != 0 and 'tet4' in out, out[-300:])
+rc, out = gconv('box8_v41a.msh', 'x.nmsh', '--extrude', 0, 1, 2, '--zbc', 'periodic')
+report('gmsh2nmsh: --extrude on a 3D mesh is refused', rc != 0, out[-200:])
+rc, out = gconv('box8_v41a.msh', 'x.nmsh', '--label', 'outlet=25')
+report('gmsh2nmsh: labels outside 1..20 are refused', rc != 0 and '1..20' in out,
+       out[-200:])
+rc, out = gconv('box8_v41a.msh', 'x.nmsh', '--periodic', '1:3')
+report('gmsh2nmsh: --periodic between non-translated zones is refused', rc != 0,
+       out[-200:])
+# 8. left-handed cells (mirrored coordinates) are fixed; reader agrees with meshio
+if have('meshio'):
+    import meshio
+    mm = meshio.read(os.path.join(GM, 'box8_v41a.msh'))
+    mm.points[:, 0] *= -1.0
+    meshio.write(wpath('mirror.msh'), mm, file_format='gmsh', binary=False)
+    rc, out = tool('gmsh2nmsh.py', wpath('mirror.msh'), wpath('mirror.nmsh'))
+    okc, cout = checker('mirror.nmsh', '--jacobian')
+    report('gmsh2nmsh: left-handed hexahedra are mirrored and pass the checker',
+           rc == 0 and 'mirrored' in out and okc and label_counts(out) == {i: 9 for i in range(1, 7)},
+           (out + cout)[-400:])
+    ok = True
+    for v in ('v22a', 'v22b', 'v41a', 'v41b'):
+        g = read_msh(os.path.join(GM, 'box8_%s.msh' % v))
+        ref = meshio.read(os.path.join(GM, 'box8_%s.msh' % v))
+        idx = g.node_index()
+        hx = np.concatenate([b.nodes for b in g.blocks if b.etype == 5])
+        ok = ok and np.allclose(g.xyz[idx[g.node_tags]], ref.points) and \
+            np.array_equal(np.sort(idx[hx], axis=0), np.sort(ref.cells_dict['hexahedron'], axis=0))
+    report('gmsh reader agrees with meshio on all four format variants', ok)
+else:
+    skip('gmsh2nmsh mirrored / meshio comparison', 'meshio not installed')
+
 # ---- summary ---------------------------------------------------------------
 nfail = sum(1 for _, ok in RESULTS if not ok)
 print('\n%d checks, %d failed' % (len(RESULTS), nfail))
