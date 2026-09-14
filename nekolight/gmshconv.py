@@ -18,6 +18,7 @@ import numpy as np
 
 from .formats import EL_DT, QUAD_DT, CURVE_DT, FACE_RE2, QFACE_RE2
 from .topology import EDGE_CYC
+from .gmsh import TagLookup
 
 # Gmsh element type -> node count, per family
 HEX_TYPES = {5: 8, 17: 20, 12: 27}
@@ -166,7 +167,7 @@ class CellSet:
         if not vol:
             sys.exit('Error: no %s cells in the mesh' % ('hexahedral' if dim == 3
                                                         else 'quadrilateral'))
-        self.nidx = gm.node_index()
+        self.nidx = gm.node_index()                 # TagLookup: tag -> xyz row
         corners, mids, tags, orders = [], [], [], []
         for b in vol:
             nn = fam[b.etype]
@@ -183,10 +184,11 @@ class CellSet:
         self.elem_tags = np.concatenate(tags)
         self.orders = np.repeat(orders, [c.shape[0] for c in corners])
         self.n = self.corner_tags.shape[0]
-        if (self.nidx[self.corner_tags] < 0).any():
+        crow = self.nidx(self.corner_tags)
+        if (crow < 0).any():
             sys.exit('Error: a cell references a node tag that is not in '
                      '$Nodes')
-        xyz = gm.xyz[self.nidx[self.corner_tags]]
+        xyz = gm.xyz[crow]
         if dim == 2:
             zr = xyz[:, :, 2]
             span = float(zr.max() - zr.min()) if zr.size else 0.0
@@ -200,15 +202,13 @@ class CellSet:
         self.flipped = (self.perm != np.arange(nv)).any(axis=1)
         # dense point ids 1..npts in order of first appearance
         uniq, inv = np.unique(self.corner_tags.ravel(), return_inverse=True)
-        self.tag_to_id = np.full(int(gm.node_tags.max()) + 1, -1, dtype=np.int64)
-        # first-appearance numbering (stable): sort unique tags by first index
         first = np.full(uniq.size, self.corner_tags.size, dtype=np.int64)
         np.minimum.at(first, inv.ravel(), np.arange(self.corner_tags.size))
         order = np.argsort(first, kind='stable')
         rank = np.empty(uniq.size, dtype=np.int64)
         rank[order] = np.arange(1, uniq.size + 1)
-        self.tag_to_id[uniq] = rank
-        self.vid = self.tag_to_id[self.corner_tags]              # (n, nv)
+        self.tag_to_id = TagLookup(uniq, rank)      # corner tag -> id, -1 else
+        self.vid = rank[inv].reshape(self.corner_tags.shape)     # (n, nv)
         self.npts = uniq.size
         self.xyz = xyz if dim == 3 else xyz[:, :, :2]
         self.xyz_full = xyz                                       # (n, nv, 3)
@@ -241,10 +241,11 @@ class CellSet:
         emap = np.where(self.flipped[rows, None], emap_mir[None, :],
                         emap_id[None, :])                              # (m, ne)
         mid_tags = self.mid_tags[rows[:, None], emap]                  # (m, ne)
-        if (self.nidx[mid_tags] < 0).any():
+        mrow = self.nidx(mid_tags)
+        if (mrow < 0).any():
             sys.exit('Error: a second-order cell references a mid-edge node '
                      'tag that is not in $Nodes')
-        mid = gm.xyz[self.nidx[mid_tags]]                              # (m, ne, 3)
+        mid = gm.xyz[mrow]                                             # (m, ne, 3)
         p1 = self.xyz_full[rows[:, None], cyc[None, :, 0]]
         p2 = self.xyz_full[rows[:, None], cyc[None, :, 1]]
         if self.dim == 2:

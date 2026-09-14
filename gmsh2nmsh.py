@@ -36,9 +36,9 @@ against Neko's format:
   labelled (--zbc BOTTOM TOP).  2D periodicity and labels are carried to
   every layer; midside curves go to the bottom and top edges of each layer.
 
-The output passes the same checks mesh_checker.py applies (zone and curve
-validity, positive corner and GLL Jacobians); the tool refuses to write
-otherwise.
+The output passes the checks mesh_checker.py applies (zone and curve
+validity, positive corner and GLL Jacobians of every element, no facet
+shared by more than two elements); the tool refuses to write otherwise.
 
 Usage:
   gmsh2nmsh.py in.msh out.nmsh
@@ -48,6 +48,7 @@ Usage:
   gmsh2nmsh.py in.msh out.nmsh --periodic 1:2 --label outlet=3
 """
 import argparse
+import os
 import sys
 
 import numpy as np
@@ -56,7 +57,8 @@ from nekolight import (banner, read_msh, CellSet, boundary_cells, UnionFind,
                        layer_planes, extrude, Mesh, ZONE_DT, MAX_ZLBLS,
                        extrude_2d, write_nmsh, validate_zones, validate_curves,
                        pos_of_elid_map, periodic_replace_merge, gll_geometry,
-                       jacobian_dets, corner_jacobians, GMSH_TYPES)
+                       jacobian_dets, corner_jacobians, GMSH_TYPES,
+                       facet_table, face_multiplicity)
 
 
 def log(msg):
@@ -76,9 +78,9 @@ def parse_args():
     ex = ap.add_argument_group('extrusion of a 2D mesh')
     ex.add_argument('--extrude', nargs=3, metavar=('Z0', 'Z1', 'NLAYERS'),
                     help='extrude between z=Z0 and z=Z1 with NLAYERS layers')
-    ex.add_argument('--gain', type=float, default=1.0,
-                    help='layer growth ratio for --extrude (1 = uniform; '
-                         'dz_k proportional to GAIN**k, as n2to3)')
+    ex.add_argument('--gain', type=float, default=None,
+                    help='layer growth ratio for --extrude (default 1 = '
+                         'uniform; dz_k proportional to GAIN**k, as n2to3)')
     ex.add_argument('--zfile', metavar='FILE',
                     help='file with the ascending z of every plane '
                          '(NLAYERS+1 values), instead of --extrude')
@@ -98,7 +100,7 @@ def parse_args():
     bc.add_argument('--no-msh-periodic', action='store_true',
                     help='ignore the $Periodic section of the file')
     bc.add_argument('--tol', type=float, default=None,
-                    help='matching tolerance for --periodic (default: '
+                    help='matching tolerance for periodic facets (default: '
                          'max(1e-10, 1e-8 * bounding-box diagonal))')
     return ap.parse_args()
 
@@ -158,29 +160,35 @@ class PeriodicGroup:
         self.name, self.pairs, self.corr, self.offset = name, pairs, corr, offset
 
 
-def match_by_translation(cells, cand_flat, offset, tol, what):
-    """Pair boundary facets F with boundary facets F + offset (slave = the
-    translated copy, master = F): centres within tol, corners one-to-one
-    within tol.  Returns (pairs (m,4): slave el, f, master el, f; 1-based)
-    and the corner correspondences (dense ids, slave, master)."""
+def match_by_translation(cells, master_flat, slave_flat, offset, tol, what):
+    """Pair every master candidate facet F with the slave candidate facet at
+    F + offset: centres within tol, corners one-to-one within tol.  Returns
+    (pairs (m,4): slave el, f, master el, f; 1-based), corner
+    correspondences (dense ids: slave, master), and the flat indices of the
+    matched master and slave facets."""
     from scipy.spatial import cKDTree
     ft = cells.facets
     nfac = ft.nf
-    elem, facet = cand_flat // nfac, cand_flat % nfac + 1
-    ids = ft.facet_ids(cells.vid, elem, facet)                       # (nb, nc)
-    x = cells.point_xyz[ids]                                          # (nb, nc, 3)
-    c = x.mean(axis=1)
-    tree = cKDTree(c)
-    d, j = tree.query(c + offset)
+    if master_flat.size == 0 or slave_flat.size == 0:
+        z = np.zeros(0, dtype=np.int64)
+        return np.zeros((0, 4), np.int64), np.zeros((0, 2), np.int64), z, z
+    me, mf = master_flat // nfac, master_flat % nfac + 1
+    se, sf = slave_flat // nfac, slave_flat % nfac + 1
+    mid = ft.facet_ids(cells.vid, me, mf)
+    sid = ft.facet_ids(cells.vid, se, sf)
+    xm, xs = cells.point_xyz[mid], cells.point_xyz[sid]              # (·, nc, 3)
+    tree = cKDTree(xs.mean(axis=1))
+    d, j = tree.query(xm.mean(axis=1) + offset)
     hit = d <= tol
     if not hit.any():
-        return np.zeros((0, 4), dtype=np.int64), np.zeros((0, 2), dtype=np.int64)
-    m = np.flatnonzero(hit)                                           # masters
-    s = j[hit]                                                        # slaves
+        z = np.zeros(0, dtype=np.int64)
+        return np.zeros((0, 4), np.int64), np.zeros((0, 2), np.int64), z, z
+    m = np.flatnonzero(hit)
+    s = j[hit]
     if np.unique(s).size != s.size:
         sys.exit('Error: %s: the translation maps two facets onto the same '
                  'facet' % what)
-    dd = np.linalg.norm(x[m][:, :, None, :] + offset - x[s][:, None, :, :],
+    dd = np.linalg.norm(xm[m][:, :, None, :] + offset - xs[s][:, None, :, :],
                         axis=3)                                       # (m,nc,nc)
     k = dd.argmin(axis=2)
     ok = (dd.min(axis=2) <= tol).all(axis=1) & \
@@ -190,69 +198,128 @@ def match_by_translation(cells, cand_flat, offset, tol, what):
                  'corners do not map one-to-one under the translation '
                  '(tolerance %.3e)' % (what, int((~ok).sum()), tol))
     rows = np.arange(m.size)[:, None]
-    corr = np.stack([ids[s][rows, k].ravel(), ids[m].ravel()], axis=1)
-    pairs = np.stack([elem[s] + 1, facet[s], elem[m] + 1, facet[m]], axis=1)
-    return pairs, np.unique(corr, axis=0)
+    corr = np.stack([sid[s][rows, k].ravel(), mid[m].ravel()], axis=1)
+    pairs = np.stack([se[s] + 1, sf[s], me[m] + 1, mf[m]], axis=1)
+    return pairs, np.unique(corr, axis=0), master_flat[m], slave_flat[s]
 
 
-def periodic_from_msh(gm, cells, dim, tol):
+def periodic_from_msh(gm, cells, dim, tol, b_ent, b_flat):
     """$Periodic links of dimension dim-1 give the periodic translations
     (Gmsh's affine maps master to slave); the facets are then paired
     geometrically, like create_periodic_zones does, because the file's
     node correspondences are split over the surface and its bounding
-    curves and points.  Links with the same translation form one group."""
-    groups = {}
-    order = []
-    for link in gm.periodic:
-        if link.dim != dim - 1:
-            continue
-        if link.affine.size == 16:
-            A = link.affine.reshape(4, 4)
+    curves and points.  Candidates are the boundary facets whose corners
+    are all periodic slave (master) nodes of the file, or -- when the file
+    carries no node correspondences -- the saved boundary cells of the
+    slave (master) entities; every candidate must end up paired.  Links
+    with the same translation form one group."""
+    ft = cells.facets
+    nfac = ft.nf
+    bflat = ft.boundary_flat
+    b_elem, b_facet = bflat // nfac, bflat % nfac + 1
+    b_tags = cells.corner_tags[b_elem[:, None], ft.slots[b_facet - 1]]  # (nb, nc)
+    links = [lk for lk in gm.periodic if lk.dim == dim - 1]
+    if not links:
+        return [], np.zeros(0, np.int64), True
+    # node-based candidate sets (all links, all dimensions)
+    all_s = np.concatenate([lk.node_map[:, 0] for lk in gm.periodic if lk.node_map.size]
+                           or [np.zeros(0, np.int64)])
+    all_m = np.concatenate([lk.node_map[:, 1] for lk in gm.periodic if lk.node_map.size]
+                           or [np.zeros(0, np.int64)])
+    have_nodes = all_s.size > 0
+    if have_nodes:
+        cand_s = bflat[np.isin(b_tags, all_s).all(axis=1)]
+        cand_m = bflat[np.isin(b_tags, all_m).all(axis=1)]
+    groups, order = {}, []
+    for lk in links:
+        if lk.affine.size == 16:
+            A = lk.affine.reshape(4, 4)
             if not np.allclose(A[:3, :3], np.eye(3), atol=1e-9):
                 sys.exit('Error: $Periodic link (entity %d -> %d) is not a '
                          'pure translation; Neko supports translational '
-                         'periodicity only' % (link.entity, link.master))
+                         'periodicity only' % (lk.entity, lk.master))
             offset = A[:3, 3].copy()
-        elif link.node_map.shape[0]:
+        elif lk.node_map.shape[0]:
             nidx = gm.node_index()
-            xs = gm.xyz[nidx[link.node_map[:, 0]]]
-            xm = gm.xyz[nidx[link.node_map[:, 1]]]
+            xs = gm.xyz[nidx(lk.node_map[:, 0])]
+            xm = gm.xyz[nidx(lk.node_map[:, 1])]
             offset = (xs - xm).mean(axis=0)
             if not np.allclose(xs - xm, offset, atol=tol):
                 sys.exit('Error: $Periodic link (entity %d -> %d) is not a '
-                         'single translation' % (link.entity, link.master))
+                         'single translation' % (lk.entity, lk.master))
         else:
-            log('        note: $Periodic link (entity %d -> %d) has neither '
-                'an affine transform nor node pairs, skipped'
-                % (link.entity, link.master))
-            continue
+            sys.exit('Error: $Periodic link (entity %d -> %d) has neither an '
+                     'affine transform nor node pairs' % (lk.entity, lk.master))
         if dim == 2:
             offset[2] = 0.0
+        if np.linalg.norm(offset) <= tol:
+            sys.exit('Error: $Periodic link (entity %d -> %d) has a zero '
+                     'translation' % (lk.entity, lk.master))
         key = tuple(np.round(offset / max(tol, 1e-12)).astype(np.int64))
         if key not in groups:
-            groups[key] = (offset, [])
+            groups[key] = (offset, [], [], [])
             order.append(key)
-        groups[key][1].append('%d->%d' % (link.entity, link.master))
+        groups[key][1].append('%d->%d' % (lk.entity, lk.master))
+        groups[key][2].append(lk.entity)
+        groups[key][3].append(lk.master)
     out = []
-    ft = cells.facets
+    matched_s = []
+    all_cand_s = []
+    verifiable = True
     for key in order:
-        offset, ents = groups[key]
-        # slave = master + offset: pair every boundary facet with its copy
-        pairs, corr = match_by_translation(cells, ft.boundary_flat, offset, tol,
-                                           '$Periodic (%s)' % ', '.join(ents))
+        offset, ents, s_ents, m_ents = groups[key]
+        what = '$Periodic (%s)' % ', '.join(ents)
+        # candidates: the saved boundary cells of the slave/master entities
+        # (complete when present); else the facets whose corners are all
+        # periodic slave/master nodes of the file (Gmsh often writes none
+        # for the surfaces themselves); else every boundary facet
+        ent_s = b_flat.size and np.isin(b_ent, s_ents).any()
+        ent_m = b_flat.size and np.isin(b_ent, m_ents).any()
+        if ent_s and ent_m:
+            cs = np.unique(b_flat[np.isin(b_ent, s_ents)])
+            cm = np.unique(b_flat[np.isin(b_ent, m_ents)])
+            group_verifiable = True
+        elif have_nodes and cand_s.size and cand_m.size:
+            cs, cm = cand_s, cand_m
+            group_verifiable = True
+        else:
+            cs = cm = bflat
+            group_verifiable = False
+            verifiable = False
+        pairs, corr, mflat, sflat = match_by_translation(cells, cm, cs, offset,
+                                                         tol, what)
         if pairs.shape[0] == 0:
-            log('        note: $Periodic translation (%s) matches no boundary '
-                'facet, skipped' % ', '.join('%g' % v for v in offset))
-            continue
+            sys.exit('Error: %s: no boundary facet maps onto another one under '
+                     'the translation (%s), tolerance %.3e'
+                     % (what, ', '.join('%g' % v for v in offset), tol))
+        matched_s.append(sflat)
+        if group_verifiable:
+            all_cand_s.append(cs)
         out.append(PeriodicGroup('$Periodic entities %s' % ', '.join(ents),
                                  pairs, corr, offset))
-    return out
+    if all_cand_s:
+        cand = np.unique(np.concatenate(all_cand_s))
+        got = np.unique(np.concatenate(matched_s))
+        miss = np.setdiff1d(cand, got)
+        if miss.size:
+            e_u = miss // nfac
+            sys.exit('Error: $Periodic: %d facet(s) of the periodic surfaces '
+                     'have no partner under the translations (e.g. element %d '
+                     'facet %d): the periodic surfaces are not exact translates '
+                     'of each other within the tolerance %.3e (--tol relaxes it)'
+                     % (miss.size, int(e_u[0]) + 1, int(miss[0] % nfac) + 1, tol))
+    if not verifiable:
+        log('        note: the file has neither saved cells of the periodic '
+            'entities nor node pairs for them, so completeness of the '
+            'periodic pairing cannot be verified')
+    return out, np.zeros(0, np.int64), verifiable
 
 
 def periodic_from_labels(label_pairs, lab_elem, lab_facet, lab_label, cells,
                          tol):
-    """--periodic A:B: pair the facets of zone A with those of zone B by the
-    mean translation (create_periodic_zones' rule)."""
+    """--periodic A:B: pair the facets of zone A (masters) with those of
+    zone B (slaves) by the mean translation (create_periodic_zones' rule);
+    every facet of both zones must be paired."""
     groups = []
     nfac = cells.facets.nf
     for a, b in label_pairs:
@@ -267,9 +334,13 @@ def periodic_from_labels(label_pairs, lab_elem, lab_facet, lab_label, cells,
         fb = lab_elem[sb] * nfac + lab_facet[sb] - 1
         ida = cells.facets.facet_ids(cells.vid, lab_elem[sa], lab_facet[sa])
         idb = cells.facets.facet_ids(cells.vid, lab_elem[sb], lab_facet[sb])
-        offset = cells.point_xyz[idb].mean(axis=(0, 1)) - cells.point_xyz[ida].mean(axis=(0, 1))
-        pairs, corr = match_by_translation(cells, np.concatenate([fa, fb]),
-                                           offset, tol, '--periodic %d:%d' % (a, b))
+        offset = cells.point_xyz[idb].mean(axis=(0, 1)) - \
+            cells.point_xyz[ida].mean(axis=(0, 1))
+        if np.linalg.norm(offset) <= tol:
+            sys.exit('Error: --periodic %d:%d: the two zones coincide (zero '
+                     'translation)' % (a, b))
+        pairs, corr, _, _ = match_by_translation(cells, fa, fb, offset, tol,
+                                                 '--periodic %d:%d' % (a, b))
         if pairs.shape[0] != sa.sum():
             sys.exit('Error: --periodic %d:%d: only %d of %d facets map onto '
                      'the other zone under the translation (%s), tolerance %.3e'
@@ -280,12 +351,28 @@ def periodic_from_labels(label_pairs, lab_elem, lab_facet, lab_label, cells,
     return groups
 
 
+def coincident_boundary_facets(cells, flat, tol):
+    """Number of pairs of distinct boundary facets with the same centre (a
+    cracked mesh: touching volumes that were not fragmented in Gmsh)."""
+    from scipy.spatial import cKDTree
+    if flat.size < 2:
+        return 0
+    ft = cells.facets
+    e, f = flat // ft.nf, flat % ft.nf + 1
+    c = cells.point_xyz[ft.facet_ids(cells.vid, e, f)].mean(axis=1)
+    pairs = cKDTree(c).query_pairs(tol)
+    return len(pairs)
+
+
 # ---------------------------------------------------------------------------
 def main():
     args = parse_args()
     log(banner('gmsh2nmsh'))
     log('  input     : %s' % args.input)
     log('  output    : %s' % args.output)
+    outdir = os.path.dirname(os.path.abspath(args.output))
+    if not os.path.isdir(outdir) or not os.access(outdir, os.W_OK):
+        sys.exit('Error: cannot write to the output directory %s' % outdir)
     gm = read_msh(args.input)
     log('  format    : msh %s %s, %d nodes, %d element blocks'
         % (gm.version, 'binary' if gm.binary else 'ASCII', gm.node_tags.size,
@@ -312,6 +399,12 @@ def main():
         sys.exit('Error: --extrude/--zfile apply to 2D (quad) meshes only')
     if args.extrude is not None and args.zfile is not None:
         sys.exit('Error: give either --extrude or --zfile, not both')
+    if args.gain is not None and args.zfile is not None:
+        sys.exit('Error: --gain has no effect with --zfile (the file gives the '
+                 'planes)')
+    if args.gain is not None and args.extrude is None:
+        sys.exit('Error: --gain only applies together with --extrude')
+    gain = 1.0 if args.gain is None else args.gain
     if extruding and not args.zbc:
         sys.exit('Error: an extrusion needs --zbc periodic or --zbc BOTTOM TOP')
     if args.zbc and not extruding:
@@ -320,15 +413,28 @@ def main():
     zbc = None
     if extruding:
         if args.zfile:
-            zplanes = np.loadtxt(args.zfile, dtype=np.float64).ravel()
+            try:
+                zplanes = np.loadtxt(args.zfile, dtype=np.float64).ravel()
+            except (OSError, ValueError) as e:
+                sys.exit('Error: cannot read the z planes from %s (%s)'
+                         % (args.zfile, e))
+            if zplanes.size < 2 or not (np.diff(zplanes) > 0).all():
+                sys.exit('Error: --zfile must hold at least two strictly '
+                         'ascending z values (one per plane)')
         else:
             try:
-                z0, z1, nlev = float(args.extrude[0]), float(args.extrude[1]), int(args.extrude[2])
+                z0, z1, nlev = float(args.extrude[0]), float(args.extrude[1]), \
+                    int(args.extrude[2])
             except ValueError:
                 sys.exit('Error: --extrude expects Z0 Z1 NLAYERS')
-            zplanes = layer_planes(z0, z1, nlev, args.gain)
+            zplanes = layer_planes(z0, z1, nlev, gain)
         if len(args.zbc) == 1 and args.zbc[0].lower() in ('periodic', 'p'):
             zbc = 'periodic'
+            if zplanes.size - 1 == 2:
+                sys.exit('Error: 2 layers with periodic z faces are not a valid '
+                         'mesh: the lateral faces of the two layers get identical '
+                         'corner ids after the periodic merge (n2to3 requires at '
+                         'least 3 layers); use 1 or 3 or more layers')
         elif len(args.zbc) == 2:
             try:
                 zbc = (int(args.zbc[0]), int(args.zbc[1]))
@@ -350,29 +456,34 @@ def main():
     names = {(d, t): nm for (d, t), nm in gm.physical_names.items() if d == dim - 1}
     relabel = parse_labels(args.label, names)
     b_corners, b_phys, b_ent, b_tags = boundary_cells(gm, dim)
-    # entities with several physical groups are ambiguous
-    multi = [(e, p) for (d, e), p in gm.entity_physical.items()
-             if d == dim - 1 and len(p) > 1]
-    if multi:
-        sys.exit('Error: boundary entity(ies) with several physical groups '
-                 '(ambiguous label): %s' % ', '.join('%d: %s' % m for m in multi))
+    # 4.1: an entity with several physical groups is ambiguous (2.2 carries
+    # the physical tag per element, so no ambiguity is possible there)
+    if gm.version.startswith('4'):
+        multi = [(e, p) for (d, e), p in gm.entity_physical.items()
+                 if d == dim - 1 and len(p) > 1]
+        if multi:
+            sys.exit('Error: boundary entity(ies) with several physical groups '
+                     '(ambiguous label): %s' % ', '.join('%d: %s' % m for m in multi))
     ft = cells.facets
     nfac = ft.nf
     bflat = ft.boundary_flat
-    is_bnd_flat = np.zeros(cells.n * nfac, dtype=bool)
-    is_bnd_flat[bflat] = True
     lab_elem = np.zeros(0, dtype=np.int64)
     lab_facet = np.zeros(0, dtype=np.int64)
     lab_label = np.zeros(0, dtype=np.int64)
     tagged_flat = np.zeros(0, dtype=np.int64)
+    b_flat_all = np.zeros(0, dtype=np.int64)     # facet of every boundary cell
+    b_ent_all = np.zeros(0, dtype=np.int64)
     if b_corners.shape[0]:
-        ids = cells.tag_to_id[np.minimum(b_corners, cells.tag_to_id.size - 1)]
-        ids[b_corners >= cells.tag_to_id.size] = -1
-        ok = (ids >= 0).all(axis=1) & (b_phys != 0)
+        ids = cells.tag_to_id(b_corners)
+        ok = (ids >= 0).all(axis=1)
         e, f, cnt = ft.lookup(np.where(ok[:, None], ids, 1))
         e[~ok] = -1
-        nomatch = ok & (e < 0)
-        internal = (e >= 0) & (cnt == 2)
+        found = (e >= 0) & (cnt == 1)
+        b_flat_all = e[found] * nfac + f[found] - 1
+        b_ent_all = b_ent[found]
+        tagged = found & (b_phys != 0)
+        nomatch = (b_phys != 0) & ~ok | ((b_phys != 0) & ok & (e < 0))
+        internal = (b_phys != 0) & (e >= 0) & (cnt == 2)
         if nomatch.any():
             log('        warning: %d tagged boundary cell(s) match no element '
                 'facet (e.g. Gmsh elements %s) -- ignored'
@@ -381,19 +492,21 @@ def main():
             log('        warning: %d tagged cell(s) lie on interior facets '
                 '(shared by two elements) -- ignored, Neko boundaries are '
                 'exterior' % int(internal.sum()))
-        keep = (e >= 0) & (cnt == 1)
-        lab_elem, lab_facet = e[keep], f[keep]
-        lab_label = np.array([relabel.get(int(p), int(p)) for p in b_phys[keep]],
+        lab_elem, lab_facet = e[tagged], f[tagged]
+        lab_label = np.array([relabel.get(int(p), int(p)) for p in b_phys[tagged]],
                              dtype=np.int64)
         tagged_flat = lab_elem * nfac + (lab_facet - 1)
-        # a facet tagged twice (two boundary cells on the same facet)
-        uq, ci = np.unique(tagged_flat, return_counts=True)
-        if (ci > 1).any():
-            dup = uq[ci > 1]
-            labs = [sorted(set(lab_label[tagged_flat == d].tolist())) for d in dup[:5]]
-            if any(len(l) > 1 for l in labs):
+        # a facet tagged by two boundary cells must carry one label
+        if tagged_flat.size:
+            uq, inv = np.unique(tagged_flat, return_inverse=True)
+            lo = np.full(uq.size, np.iinfo(np.int64).max); hi = np.zeros(uq.size, np.int64)
+            np.minimum.at(lo, inv, lab_label); np.maximum.at(hi, inv, lab_label)
+            conflict = lo != hi
+            if conflict.any():
+                ex = np.flatnonzero(conflict)[:3]
                 sys.exit('Error: %d boundary facet(s) carry two different '
-                         'labels, e.g. %s' % (int((ci > 1).sum()), labs[:3]))
+                         'labels, e.g. %s' % (int(conflict.sum()),
+                                              ['%d/%d' % (lo[i], hi[i]) for i in ex]))
             first = np.unique(tagged_flat, return_index=True)[1]
             lab_elem, lab_facet, lab_label, tagged_flat = \
                 lab_elem[first], lab_facet[first], lab_label[first], tagged_flat[first]
@@ -405,7 +518,8 @@ def main():
         lo = cells.point_xyz[1:].min(axis=0); hi = cells.point_xyz[1:].max(axis=0)
         tol = max(1e-10, 1e-8 * max(1.0, float(np.linalg.norm(hi - lo))))
     if not args.no_msh_periodic:
-        groups += periodic_from_msh(gm, cells, dim, tol)
+        g_msh, _, _ = periodic_from_msh(gm, cells, dim, tol, b_ent_all, b_flat_all)
+        groups += g_msh
     label_pairs = parse_periodic(args.periodic)
     if label_pairs:
         groups += periodic_from_labels(label_pairs, lab_elem, lab_facet,
@@ -414,8 +528,12 @@ def main():
     per_flat = np.zeros(0, dtype=np.int64)
     if groups:
         allp = np.concatenate([g.pairs for g in groups])
-        per_flat = np.unique(np.concatenate([(allp[:, 0] - 1) * nfac + allp[:, 1] - 1,
-                                             (allp[:, 2] - 1) * nfac + allp[:, 3] - 1]))
+        s_flat = (allp[:, 0] - 1) * nfac + allp[:, 1] - 1
+        m_flat = (allp[:, 2] - 1) * nfac + allp[:, 3] - 1
+        both = np.concatenate([s_flat, m_flat])
+        if np.unique(both).size != both.size:
+            sys.exit('Error: a facet appears in two periodic pairings')
+        per_flat = np.unique(both)
         if lab_elem.size:
             drop = np.isin(tagged_flat, per_flat)
             if drop.any():
@@ -423,10 +541,6 @@ def main():
                     'label (labels %s)' % (int(drop.sum()), sorted(set(lab_label[drop].tolist()))))
             lab_elem, lab_facet, lab_label, tagged_flat = \
                 lab_elem[~drop], lab_facet[~drop], lab_label[~drop], tagged_flat[~drop]
-        # a facet paired twice (two groups) is an error
-        per_all = np.concatenate([(allp[:, 0] - 1) * nfac + allp[:, 1] - 1])
-        if np.unique(per_all).size != per_all.size:
-            sys.exit('Error: a facet appears in two periodic pairings')
 
     # ---- untagged boundary facets ------------------------------------------
     covered = np.zeros(cells.n * nfac, dtype=bool)
@@ -434,13 +548,23 @@ def main():
     covered[per_flat] = True
     untagged = bflat[~covered[bflat]]
     if untagged.size:
+        cracks = coincident_boundary_facets(cells, untagged, tol)
+        if cracks:
+            sys.exit('Error: %d pair(s) of boundary facets coincide: the mesh '
+                     'has duplicated points along an interior interface '
+                     '(volumes that touch but were not fragmented -- use '
+                     'BooleanFragments / Coherence in Gmsh)' % cracks)
         if args.untagged is None:
             e_u = untagged // nfac
+            hint = ('tag every boundary surface in Gmsh with a physical group '
+                    '(Gmsh saves only entities in physical groups, unless '
+                    'Mesh.SaveAll is set -- which in format 2.2 drops the '
+                    'physical tags, so use format 4.1 with SaveAll)')
             sys.exit('Error: %d boundary facet(s) belong to no physical group '
-                     '(e.g. element %d facet %d); tag every boundary surface '
-                     'in Gmsh (and save it: physical groups, or Mesh.SaveAll) '
-                     'or give them a label with --untagged LABEL'
-                     % (untagged.size, int(e_u[0]) + 1, int(untagged[0] % nfac) + 1))
+                     '(e.g. element %d facet %d); %s, or give them a label with '
+                     '--untagged LABEL'
+                     % (untagged.size, int(e_u[0]) + 1, int(untagged[0] % nfac) + 1,
+                        hint))
         log('        %d untagged boundary facet(s) get label %d'
             % (untagged.size, args.untagged))
         lab_elem = np.concatenate([lab_elem, untagged // nfac])
@@ -456,26 +580,20 @@ def main():
     curves = cells.curves
     vid = cells.vid.astype(np.int64)
     npts = cells.npts
-    point_xyz = cells.point_xyz
     nelv = cells.n
     if extruding:
         nlev = zplanes.size - 1
         log('  [3/4] extruding %d layers, z = %g .. %g%s ...'
             % (nlev, zplanes[0], zplanes[-1],
-               '' if args.gain == 1.0 or args.zfile else ' (gain %g)' % args.gain))
+               ' (gain %g)' % gain if args.gain is not None else ''))
         elems, curves, npts2d = extrude(vid, cells.xyz_full, zplanes, curves)
         vid = elems['v']['idx'].astype(np.int64)
         npts = npts2d * (nlev + 1)
-        pxyz = np.zeros((npts + 1, 3))
-        pxyz[vid.ravel()] = elems['v']['xyz'].reshape(-1, 3)
-        point_xyz = pxyz
         n2 = nelv
         nelv = elems.shape[0]
-        # labelled facets on every layer
         lab_elem = np.concatenate([lab_elem + k * n2 for k in range(nlev)])
         lab_facet = np.tile(lab_facet, nlev)
         lab_label = np.tile(lab_label, nlev)
-        # periodic groups on every layer (pairs and point correspondences)
         new_groups = []
         for g in groups:
             pairs = np.concatenate([g.pairs + np.array([k * n2, 0, k * n2, 0])
@@ -505,7 +623,6 @@ def main():
 
     # ---- zone records ---------------------------------------------------------
     log('  [4/4] zones, checks and output ...')
-    from nekolight import facet_table
     fts = facet_table(8 if gdim == 3 else 4)
     nc = fts.shape[1]
     uf = UnionFind(npts)
@@ -541,27 +658,47 @@ def main():
             if (fin[g.corr[:, 0]] != fin[g.corr[:, 1]]).any():
                 sys.exit('Error: internal: periodic correspondence not realised '
                          'for %s' % g.name)
-    # geometry checks
+        # a periodic direction two elements thick makes distinct faces share
+        # all their corner ids (n2to3 refuses nlev < 3 for the same reason)
+        mult, _ = face_multiplicity(merged)
+        if (mult > 2).any():
+            sys.exit('Error: after the periodic merge %d facet(s) are shared by '
+                     'more than two elements: a periodic direction is only two '
+                     'elements thick, so distinct faces get identical corner '
+                     'ids; use one or at least three elements across it'
+                     % int((mult > 2).sum()))
+    # geometry checks: corner Jacobians, then the GLL Jacobian of every
+    # element (curves applied), chunked as mesh_checker does
     det = corner_jacobians(elems['v']['xyz'] if gdim == 3 else elems['v']['xyz'][:, :, :2])
     if (det <= 0).any():
         sys.exit('Error: internal: %d element(s) with non-positive corner '
                  'Jacobian after conversion' % int((det <= 0).any(axis=1).sum()))
-    minj = None
-    if curves.size:
-        m3 = Mesh(nelv, elems, zones, curves, 0, gdim)
-        if gdim == 2:
-            m3 = extrude_2d(m3)
-        rows = np.unique(pos[curves['e'].astype(np.int64)])
+    m3 = Mesh(nelv, elems, zones, curves, 0, gdim)
+    if gdim == 2:
+        m3 = extrude_2d(m3)
+    minj = np.inf
+    nbad = 0
+    first_bad = None
+    chunk = 1 << 16
+    for start in range(0, nelv, chunk):
+        rows = np.arange(start, min(start + chunk, nelv))
         x27, _ = gll_geometry(m3.elems['v']['xyz'], m3.curves, pos, rows)
         dets = jacobian_dets(x27)
-        minj = float(dets.min())
-        if minj <= 0.0:
-            bad = rows[(dets <= 0).any(axis=1)]
-            sys.exit('Error: %d curved element(s) have a non-positive GLL '
-                     'Jacobian (e.g. element %d): the mid-edge nodes deviate '
-                     'too much from the chord; refine or straighten the Gmsh '
-                     'mesh' % (bad.size, int(elems['id'][bad[0]])))
-    write_nmsh(args.output, elems, (zp, zl), curves, inputs=(args.input,))
+        minj = min(minj, float(dets.min()))
+        bad = (dets <= 0).any(axis=1)
+        if bad.any():
+            nbad += int(bad.sum())
+            if first_bad is None:
+                first_bad = int(elems['id'][rows[np.flatnonzero(bad)[0]]])
+    if nbad:
+        sys.exit('Error: %d element(s) have a non-positive GLL Jacobian (e.g. '
+                 'element %d; minimum %.3e): the cell is too distorted, or its '
+                 'mid-edge nodes deviate too much from the chord; refine or '
+                 'straighten the Gmsh mesh' % (nbad, first_bad, minj))
+    try:
+        write_nmsh(args.output, elems, (zp, zl), curves, inputs=(args.input,))
+    except OSError as e:
+        sys.exit('Error: cannot write %s (%s)' % (args.output, e))
 
     # ---- report -----------------------------------------------------------------
     log('  elements  : %d (%dD), %d points, %d curved elements'
@@ -574,7 +711,6 @@ def main():
                 pname[relabel.get(t, t)] = nm
         for lb in sorted(set(lab_label.tolist())):
             n = int((lab_label == lb).sum())
-            extra = ''
             if zbc not in (None, 'periodic') and lb in zbc:
                 extra = 'z-face' if lb not in pname else pname[lb] + ' / z-face'
             elif args.untagged is not None and lb == args.untagged:
@@ -585,8 +721,8 @@ def main():
     for g in groups:
         log('  periodic  : %-32s %6d facet pairs, translation (%s)'
             % (g.name, g.pairs.shape[0], ', '.join('%g' % v for v in g.offset)))
-    if minj is not None:
-        log('  curved GLL Jacobian minimum: %.4g' % minj)
+    log('  GLL Jacobian minimum: %.4g%s'
+        % (minj, ' (curved geometry)' if curves.size else ''))
     log('  done -> %s' % args.output)
 
 

@@ -223,9 +223,10 @@ same conventions:
   (surfaces in 3D, curves in 2D); the physical tag becomes the Neko label
   (1..20; `--label outlet=3` or `--label 7=3` renames).  Facets are matched
   by node-id set, as gmsh2nek does.  Remember that Gmsh saves only entities
-  in physical groups unless `Mesh.SaveAll` is set; untagged boundary facets
-  are an error unless `--untagged LABEL` gives them a label.  Tagged
-  interior facets are ignored with a warning.
+  in physical groups unless `Mesh.SaveAll` is set (in format 4.1; in 2.2
+  `SaveAll` drops the physical tags); untagged boundary facets are an error
+  unless `--untagged LABEL` gives them a label.  Tagged interior facets are
+  ignored with a warning.
 * **Periodicity.**  The file's `$Periodic` links (from `Periodic Surface`
   / `setPeriodic`) supply the translations; the facets are then paired
   geometrically, like `create_periodic_zones.py`, because Gmsh splits the
@@ -244,15 +245,22 @@ same conventions:
   lower plane and 5-8 at the upper one, 2D facets 1-4 become hex facets
   1-4 with their labels and periodicity on every layer, midside curves go
   to the bottom and top edges of each layer, and the new faces are either
-  periodic across the stack (`--zbc periodic`, any number of layers) or
-  labelled (`--zbc BOTTOM TOP`).  n2to3's circular sweep and its
+  periodic across the stack (`--zbc periodic`; one layer reproduces Neko's
+  own slab semantics, two layers are refused because distinct lateral faces
+  would share all their corner ids after the merge -- n2to3 requires three)
+  or labelled (`--zbc BOTTOM TOP`).  n2to3's circular sweep and its
   conjugate-heat-transfer (solid element) handling are not implemented.
-* **Checks.**  The output must pass what `mesh_checker.py --jacobian`
-  checks (zone and curve validity, positive corner Jacobians, positive GLL
-  Jacobians of the curved geometry); otherwise nothing is written.  The
-  report lists every label with its physical name and facet count, every
-  periodic pairing with its translation, and the curved-geometry Jacobian
-  minimum.
+* **Checks.**  Before writing, the tool verifies what `mesh_checker.py
+  --jacobian` would check and more: zone and curve validity, positive corner
+  Jacobians, a positive GLL Jacobian for every element (curves applied), no
+  facet shared by more than two elements after the periodic merge, every
+  facet of a periodic surface paired (a surface that is not an exact
+  translate of its partner within the tolerance is an error, not a wall),
+  and no coincident boundary facets (touching volumes that were not
+  fragmented in Gmsh leave duplicated points along the interface).
+  Otherwise nothing is written.  The report lists every label with its
+  physical name and facet count, every periodic pairing with its
+  translation, and the GLL Jacobian minimum.
 
 Test fixtures generated with the Gmsh Python API are in `tests/gmsh/`
 (`generate.py` recreates them).

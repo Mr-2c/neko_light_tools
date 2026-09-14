@@ -1130,6 +1130,82 @@ if have('meshio'):
 else:
     skip('gmsh2nmsh mirrored / meshio comparison', 'meshio not installed')
 
+# 9. review cases: genuine hex20/quad8 fixtures, refusals that keep Neko safe
+rc, out = gconv('annulus3d_h20_v41a.msh', 'h20check.nmsh')
+report('gmsh2nmsh: the hex20 fixture really is hex20/quad8', rc == 0 and 'hex20' in out
+       and 'quad8' in out, out[-200:])
+rc1, o1 = gconv('annulus2d_q8_v41a.msh', 'a2q8.nmsh')
+rc2, o2 = gconv('annulus2d_q9_v22a.msh', 'a2q9.nmsh')
+report('gmsh2nmsh: quad8 and quad9 versions give the same 2D mesh',
+       rc1 == 0 and rc2 == 0 and 'quad8' in o1 and same_mesh('a2q8.nmsh', 'a2q9.nmsh', rtol=1e-9),
+       (o1 + o2)[-300:])
+rc, out = gconv('box2z_per_v41a.msh', 'b2z.nmsh')
+report('gmsh2nmsh: a periodic direction two elements thick is refused',
+       rc != 0 and 'more than two elements' in out and not os.path.exists(wpath('b2z.nmsh')),
+       out[-300:])
+rc, out = gconv('rect2d_per_q4_v41a.msh', 'x2.nmsh', '--extrude', 0, 1, 2, '--zbc', 'periodic')
+report('gmsh2nmsh: two periodic layers are refused (n2to3 needs three)',
+       rc != 0 and 'layers' in out, out[-300:])
+rc, out = gconv('nofrag_v41a.msh', 'nf.nmsh', '--untagged', 7)
+report('gmsh2nmsh: a cracked interface (unfragmented volumes) is refused',
+       rc != 0 and 'coincide' in out and not os.path.exists(wpath('nf.nmsh')), out[-300:])
+rc, out = gconv('badhex_v22a.msh', 'bh.nmsh', '--untagged', 1)
+report('gmsh2nmsh: positive corner but negative GLL Jacobian is refused',
+       rc != 0 and 'GLL Jacobian' in out and not os.path.exists(wpath('bh.nmsh')), out[-300:])
+txt = open(os.path.join(GM, 'boxper8_v41a.msh')).read()
+txt = txt.replace('16 1 0 0 3 0 1 0 0 0 0 1 0 0 0 0 1', '16 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1')
+open(wpath('identity.msh'), 'w').write(txt)
+rc, out = tool('gmsh2nmsh.py', wpath('identity.msh'), wpath('identity.nmsh'))
+report('gmsh2nmsh: a $Periodic link with zero translation is refused',
+       rc != 0 and 'zero translation' in out, out[-300:])
+# 2.2 file with one (physical) tag per element, and sparse node tags
+lines = open(os.path.join(GM, 'box8_v22a.msh')).read().split('\n')
+out1, out2, sec = [], [], None
+S = 100000000
+for ln in lines:
+    if ln.startswith('$'):
+        sec = ln; out1.append(ln); out2.append(ln); continue
+    p = ln.split()
+    l1, l2 = ln, ln
+    if sec == '$Elements' and len(p) > 3:
+        nt = int(p[2])
+        if nt == 2:
+            l1 = ' '.join(p[:2] + ['1', p[3]] + p[5:])
+        l2 = ' '.join(p[:3 + nt] + [str(int(v) + S) for v in p[3 + nt:]])
+    elif sec == '$Nodes' and len(p) == 4:
+        l2 = ' '.join([str(int(p[0]) + S)] + p[1:])
+    out1.append(l1); out2.append(l2)
+open(wpath('ntags1.msh'), 'w').write('\n'.join(out1))
+open(wpath('sparse.msh'), 'w').write('\n'.join(out2))
+rc, out = tool('gmsh2nmsh.py', wpath('ntags1.msh'), wpath('ntags1.nmsh'))
+report('gmsh2nmsh: msh 2.2 with only the physical tag per element converts',
+       rc == 0 and label_counts(out) == {i: 9 for i in range(1, 7)}, out[-300:])
+import time as _time
+t0 = _time.time()
+rc, out = tool('gmsh2nmsh.py', wpath('sparse.msh'), wpath('sparse.nmsh'))
+report('gmsh2nmsh: node tags offset by 1e8 cost nothing (sorted lookup)',
+       rc == 0 and _time.time() - t0 < 10.0 and same_mesh('sparse.nmsh', 'gbox_v22a.nmsh'),
+       out[-200:] + ' %.1fs' % (_time.time() - t0))
+rc, out = gconv('rect2d_per_q4_v41a.msh', 'x.nmsh', '--zfile', wpath('nosuch.txt'), '--zbc', 5, 6)
+report('gmsh2nmsh: a missing --zfile is a clean error', rc != 0 and 'Traceback' not in out
+       and 'cannot read' in out, out[-200:])
+rc, out = gconv('box8_v41a.msh', '../nonexistent_dir/x.nmsh')
+report('gmsh2nmsh: an unwritable output directory is a clean error',
+       rc != 0 and 'Traceback' not in out and 'output directory' in out, out[-200:])
+rc, out = gconv('rect2d_per_q4_v41a.msh', 'x.nmsh', '--zfile', wpath('planes.txt'), '--gain', 2,
+                '--zbc', 5, 6)
+report('gmsh2nmsh: --gain together with --zfile is refused', rc != 0 and 'gain' in out,
+       out[-200:])
+if have('meshio'):
+    mm = meshio.read(os.path.join(GM, 'boxper8_v41a.msh'))
+    sel = np.flatnonzero((np.abs(mm.points[:, 0] - 3) < 1e-9) & (mm.points[:, 1] > 0.1)
+                         & (mm.points[:, 1] < 1.9) & (mm.points[:, 2] > 0.1) & (mm.points[:, 2] < 0.9))
+    mm.points[sel[0], 1] += 1e-5
+    meshio.write(wpath('pert.msh'), mm, file_format='gmsh', binary=False)
+    rc, out = tool('gmsh2nmsh.py', wpath('pert.msh'), wpath('pert.nmsh'))
+    report('gmsh2nmsh: a partly matching periodic surface is refused, not '
+           'turned into a wall', rc != 0 and 'no partner' in out, out[-300:])
+
 # ---- summary ---------------------------------------------------------------
 nfail = sum(1 for _, ok in RESULTS if not ok)
 print('\n%d checks, %d failed' % (len(RESULTS), nfail))

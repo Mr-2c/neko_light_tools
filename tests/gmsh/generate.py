@@ -1,4 +1,4 @@
-"""Generate the Gmsh fixtures of run_tests.py with the Gmsh Python API (pip install gmsh); run from this directory.
+"""Generate the Gmsh fixtures of run_tests.py with the Gmsh Python API (pip install gmsh); run from this directory."""
 import gmsh, numpy as np, sys
 gmsh.initialize()
 gmsh.option.setNumber("General.Terminal", 0)
@@ -65,7 +65,9 @@ gmsh.model.addPhysicalGroup(1, [l1], 1, name='bottom'); gmsh.model.addPhysicalGr
 gmsh.model.addPhysicalGroup(2, [s], 10, name='fluid')
 gmsh.model.mesh.generate(2); write_all('annulus2d_q4', versions=((4.1, 0, 'v41a'), (2.2, 0, 'v22a')))
 gmsh.model.mesh.setOrder(2); write_all('annulus2d_q9', versions=((4.1, 0, 'v41a'), (2.2, 0, 'v22a'), (4.1, 1, 'v41b')))
-gmsh.option.setNumber("Mesh.SecondOrderIncomplete", 1); gmsh.model.mesh.setOrder(2); write_all('annulus2d_q8', versions=((4.1, 0, 'v41a'),)); gmsh.option.setNumber("Mesh.SecondOrderIncomplete", 0)
+# incomplete second order (quad8): setOrder(2) on a second-order mesh is a no-op, so go back to order 1 first
+gmsh.model.mesh.setOrder(1); gmsh.option.setNumber("Mesh.SecondOrderIncomplete", 1); gmsh.model.mesh.setOrder(2)
+write_all('annulus2d_q8', versions=((4.1, 0, 'v41a'),)); gmsh.option.setNumber("Mesh.SecondOrderIncomplete", 0)
 # 3D extruded annulus (gmsh extrusion, 2 layers), hex27 and hex20
 s, (l1, a1, l2, a2) = annulus2d("annulus3d")
 ext = gmsh.model.occ.extrude([(2, s)], 0, 0, 0.5, numElements=[2], recombine=True); gmsh.model.occ.synchronize()
@@ -88,7 +90,25 @@ for dim, tag in gmsh.model.getEntities(2):
 gmsh.model.addPhysicalGroup(3, [vol], 10, name='fluid')
 gmsh.model.mesh.generate(3); write_all('annulus3d_h8', versions=((4.1, 0, 'v41a'),))
 gmsh.model.mesh.setOrder(2); write_all('annulus3d_h27', versions=((4.1, 0, 'v41a'), (4.1, 1, 'v41b'), (2.2, 0, 'v22a'), (2.2, 1, 'v22b')))
-gmsh.option.setNumber("Mesh.SecondOrderIncomplete", 1); gmsh.model.mesh.setOrder(2); write_all('annulus3d_h20', versions=((4.1, 0, 'v41a'),)); gmsh.option.setNumber("Mesh.SecondOrderIncomplete", 0)
+gmsh.model.mesh.setOrder(1); gmsh.option.setNumber("Mesh.SecondOrderIncomplete", 1); gmsh.model.mesh.setOrder(2)
+write_all('annulus3d_h20', versions=((4.1, 0, 'v41a'),)); gmsh.option.setNumber("Mesh.SecondOrderIncomplete", 0)
+# (f) two touching boxes that were NOT fragmented: duplicated points on the interface (a cracked mesh)
+gmsh.model.add("nofrag"); b1 = gmsh.model.occ.addBox(0, 0, 0, 1, 1, 1); b2 = gmsh.model.occ.addBox(1, 0, 0, 1, 1, 1); gmsh.model.occ.synchronize()
+transfinite_all(2)
+for dim, tag in gmsh.model.getEntities(2):
+    c = gmsh.model.occ.getCenterOfMass(2, tag)
+    if abs(c[0] - 1.0) > 1e-9:
+        gmsh.model.addPhysicalGroup(2, [tag], 1 + tag % 20)
+gmsh.model.addPhysicalGroup(3, [b1, b2], 10); gmsh.model.mesh.generate(3); write_all('nofrag', versions=((4.1, 0, 'v41a'),))
+# (g) z-periodic box only two elements thick in z (invalid after the periodic merge)
+gmsh.model.add("box2z"); b = gmsh.model.occ.addBox(0, 0, 0, 1, 1, 0.5); gmsh.model.occ.synchronize()
+for dim, tag in gmsh.model.getEntities(1):
+    c = gmsh.model.occ.getCenterOfMass(1, tag)
+    gmsh.model.mesh.setTransfiniteCurve(tag, 3 if abs(c[2] - 0.25) < 1e-9 and (abs(c[0]) < 1e-9 or abs(c[0] - 1) < 1e-9) and (abs(c[1]) < 1e-9 or abs(c[1] - 1) < 1e-9) else 4)
+for dim, tag in gmsh.model.getEntities(2): gmsh.model.mesh.setTransfiniteSurface(tag); gmsh.model.mesh.setRecombine(2, tag)
+gmsh.model.mesh.setTransfiniteVolume(b); tag_box_surfaces(1, 1, 0.5); gmsh.model.addPhysicalGroup(3, [b], 10)
+gmsh.model.mesh.setPeriodic(2, [surf_at(2, 0.5)], [surf_at(2, 0.0)], [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0.5, 0, 0, 0, 1])
+gmsh.model.mesh.generate(3); write_all('box2z_per', versions=((4.1, 0, 'v41a'),))
 # (d) 2D rectangle, x-periodic via setPeriodic on curves, tagged sides: 1 left 2 right 3 bottom 4 top
 gmsh.model.add("rect2d"); r = gmsh.model.occ.addRectangle(0, 0, 0, 4, 1); gmsh.model.occ.synchronize()
 for dim, tag in gmsh.model.getEntities(1):

@@ -58,10 +58,38 @@ class GmshMesh(NamedTuple):
     periodic: list              # [PeriodicLink]
 
     def node_index(self):
-        """Dense lookup: node tag -> row of xyz (-1 for unknown tags)."""
-        idx = np.full(int(self.node_tags.max()) + 1, -1, dtype=np.int64)
-        idx[self.node_tags] = np.arange(self.node_tags.size)
-        return idx
+        """Lookup object: ``rows(tags)`` gives the row of xyz for each node
+        tag (-1 for unknown tags).  Sorted search, so sparse or offset tags
+        cost nothing extra."""
+        return TagLookup(self.node_tags, np.arange(self.node_tags.size))
+
+
+class TagLookup:
+    """Map integer tags to values by sorted search (memory O(n), not
+    O(max tag)); unknown tags map to ``missing``."""
+
+    def __init__(self, tags, values, missing=-1):
+        order = np.argsort(tags, kind='stable')
+        self.tags = np.asarray(tags, dtype=np.int64)[order]
+        self.values = np.asarray(values)[order]
+        self.missing = missing
+        if self.tags.size and (np.diff(self.tags) == 0).any():
+            raise ValueError('duplicate tags')
+
+    def __call__(self, q):
+        return self.rows(q)
+
+    def rows(self, q):
+        q = np.asarray(q, dtype=np.int64)
+        pos = np.searchsorted(self.tags, q.ravel())
+        pos[pos >= self.tags.size] = 0
+        hit = self.tags[pos] == q.ravel() if self.tags.size else np.zeros(q.size, bool)
+        out = np.where(hit, self.values[pos], self.missing)
+        return out.reshape(q.shape)
+
+    @property
+    def size(self):
+        return self.tags.size
 
 
 class _Cursor:
@@ -202,6 +230,20 @@ def _read_v2(c, version, binary, path):
                 a = np.array(txt.split(), dtype=np.float64).reshape(n, 4)
                 node_tags = a[:, 0].astype(np.int64)
                 xyz = a[:, 1:4].copy()
+        elif name == b'ParametricNodes':
+            # Mesh.SaveParametric with format 2.2: tag x y z dim entity [u [v]]
+            n = int(c.line())
+            if binary:
+                sys.exit('Error: %s: binary $ParametricNodes (Mesh.SaveParametric '
+                         'with format 2.2) is not supported; save without '
+                         'parametric coordinates or use format 4.1' % path)
+            txt = c.ascii_block(name)
+            rows = [r.split() for r in txt.split(b'\n') if r.strip()]
+            if len(rows) != n:
+                sys.exit('Error: %s: $ParametricNodes announces %d nodes, found '
+                         '%d lines' % (path, n, len(rows)))
+            node_tags = np.array([r[0] for r in rows], dtype=np.int64)
+            xyz = np.array([r[1:4] for r in rows], dtype=np.float64)
         elif name == b'Elements':
             n = int(c.line())
             if binary:
@@ -212,7 +254,7 @@ def _read_v2(c, version, binary, path):
                     rec = c.bin('<i4', nel * (1 + ntags + nn)).reshape(
                         nel, 1 + ntags + nn).astype(np.int64)
                     phys = rec[:, 1] if ntags >= 1 else np.zeros(nel, np.int64)
-                    ent = rec[:, 2] if ntags >= 2 else np.zeros(nel, np.int64)
+                    ent = rec[:, 2] if ntags >= 2 else np.full(nel, -1, np.int64)
                     _add_v2_blocks(blocks, etype, phys, ent, rec[:, 0],
                                    rec[:, 1 + ntags:])
                     done += nel
@@ -239,7 +281,7 @@ def _read_v2(c, version, binary, path):
                                  'unexpected number of entries' % (path, etype))
                     a = a.reshape(sel.size, 3 + ntags + nn)
                     phys = a[:, 3] if ntags >= 1 else np.zeros(sel.size, np.int64)
-                    ent = a[:, 4] if ntags >= 2 else np.zeros(sel.size, np.int64)
+                    ent = a[:, 4] if ntags >= 2 else np.full(sel.size, -1, np.int64)
                     _add_v2_blocks(blocks, etype, phys, ent, a[:, 0],
                                    a[:, 3 + ntags:])
         elif name == b'Periodic':
@@ -250,11 +292,13 @@ def _read_v2(c, version, binary, path):
             c.ascii_block(name) if not binary else _skip_binary_section(c, name)
     if node_tags is None or not blocks:
         sys.exit('Error: %s: no $Nodes / $Elements section found' % path)
-    # entity -> physical map is implicit in 2.2 (per element)
+    # 2.2 has no entity section: the physical tag is per element and never
+    # ambiguous, so the entity -> physical map is only informative (entity
+    # -1 = elements without an elementary tag)
     ent_phys = {}
     for b in blocks:
         for p in np.unique(b.physical):
-            if p:
+            if p and b.entity >= 0:
                 ent_phys.setdefault((b.dim, b.entity), [])
                 if p not in ent_phys[(b.dim, b.entity)]:
                     ent_phys[(b.dim, b.entity)].append(int(p))
