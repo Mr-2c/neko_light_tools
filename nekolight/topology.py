@@ -295,3 +295,86 @@ def dual_graph(cell):
     A.eliminate_zeros()
     A.sum_duplicates()
     return A
+
+
+# ---------------------------------------------------------------------------
+# Structural consistency checks (silent failure modes of the format)
+# ---------------------------------------------------------------------------
+# the 12 hex edges in the CYCLIC (re2 / curve-record column) order, as nmsh
+# file slots: edges 1-4 around the bottom face, 5-8 around the top, 9-12
+# vertical -- the order geometry.EDGE_MID_NODE (dofmap's eindx) implies
+EDGE_CYC = np.array([[0, 1], [1, 2], [2, 3], [3, 0], [4, 5], [5, 6], [6, 7],
+                     [7, 4], [0, 4], [1, 5], [2, 6], [3, 7]], dtype=np.int64)
+
+
+def point_coordinate_conflicts(elems):
+    """Point ids that carry more than one coordinate triple.
+
+    Neko's ``mesh_add_point`` keys its point table on the id and keeps the
+    FIRST occurrence's coordinates, per rank -- so a file whose element
+    records disagree about the position of one id gives rank-count-dependent
+    geometry without any error.  Compares bit-exactly.  Returns
+    (n_conflicting_ids, max_abs_gap, first_conflicting_id)."""
+    ids = np.asarray(elems['v']['idx']).astype(np.int64).ravel()
+    xyz = np.asarray(elems['v']['xyz']).reshape(-1, 3)
+    uniq, first, inv = np.unique(ids, return_index=True, return_inverse=True)
+    inv = inv.ravel()
+    ref = xyz[first][inv]                          # first occurrence per id
+    gap = np.abs(xyz - ref).max(axis=1)
+    bad = gap > 0.0
+    if not bad.any():
+        return 0, 0.0, 0
+    bad_ids = np.unique(ids[bad])
+    return int(bad_ids.size), float(gap.max()), int(bad_ids[0])
+
+
+def midside_conflicts(elems, curves, pos_of_elid):
+    """Type-4 (midside) curve data that disagrees across a shared edge.
+
+    Neko applies every element's curve record to that element alone, so two
+    elements sharing an edge must store the same midside point -- and an
+    edge that is curved in one element but straight in its neighbour is a
+    geometric crack unless the midside point happens to be the chord
+    midpoint.  The gather-scatter still couples the (now non-coincident)
+    nodes, so Neko runs on such a mesh without complaint.  Edges are keyed
+    by their raw end-point ids.  Returns (n_curved_edges, n_disagreeing,
+    max_gap, n_mixed_edges, max_mixed_gap); arcs (type 3) are not checked.
+    """
+    vidx = np.asarray(elems['v']['idx']).astype(np.int64)
+    xyz = np.asarray(elems['v']['xyz'])
+    if curves.size == 0:
+        return 0, 0, 0.0, 0, 0.0
+    rows = pos_of_elid[curves['e'].astype(np.int64)]
+    ci, ck = np.nonzero(curves['type'] == 4)               # record, edge col
+    if ci.size == 0:
+        return 0, 0, 0.0, 0, 0.0
+    er = rows[ci]
+    a = vidx[er, EDGE_CYC[ck, 0]]
+    b = vidx[er, EDGE_CYC[ck, 1]]
+    key = (np.minimum(a, b).astype(np.uint64) << np.uint64(32)) \
+        | np.maximum(a, b).astype(np.uint64)
+    mid = curves['data'][ci, ck, :3]
+    order = np.argsort(key, kind='stable')
+    key_s, mid_s = key[order], mid[order]
+    uk, first, inv = np.unique(key_s, return_index=True, return_inverse=True)
+    inv = inv.ravel()
+    gap = np.abs(mid_s - mid_s[first][inv]).max(axis=1)
+    n_dis = int(np.unique(key_s[gap > 0.0]).size)
+    max_gap = float(gap.max()) if gap.size else 0.0
+    # mixed edges: the same raw-id edge appears uncurved in another element
+    all_a = vidx[:, EDGE_CYC[:, 0]].ravel()
+    all_b = vidx[:, EDGE_CYC[:, 1]].ravel()
+    all_key = (np.minimum(all_a, all_b).astype(np.uint64) << np.uint64(32)) \
+        | np.maximum(all_a, all_b).astype(np.uint64)
+    curved_flag = np.zeros(vidx.shape[0] * 12, dtype=bool)
+    curved_flag[er * 12 + ck] = True
+    unc_keys = np.unique(all_key[~curved_flag])
+    mixed = np.isin(uk, unc_keys)
+    n_mixed = int(mixed.sum())
+    max_mixed = 0.0
+    if n_mixed:
+        sel = mixed[inv]                                  # curved entries
+        chord = 0.5 * (xyz[er[order][sel], EDGE_CYC[ck[order][sel], 0]]
+                       + xyz[er[order][sel], EDGE_CYC[ck[order][sel], 1]])
+        max_mixed = float(np.abs(mid_s[sel] - chord).max())
+    return int(uk.size), n_dis, max_gap, n_mixed, max_mixed

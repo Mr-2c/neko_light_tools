@@ -19,7 +19,11 @@ labelled zone, unlabelled external faces, plus the curve records and (with
 from the file, curved edges included.  A 2D (quad) file is checked as the
 one-element-thick slab Neko extrudes it into.  Any malformed record
 (out-of-range reference, bad label, truncated section) is a hard error: this
-tool never blesses a file it could not fully parse.
+tool never blesses a file it could not fully parse.  Two structural defects
+Neko itself does not detect are errors too: a point id stored with two
+different coordinates (Neko keeps whichever a rank reads first, so the
+geometry would depend on the rank count) and midside points that disagree
+across a shared edge (a geometric crack).
 
 Options:
   --jacobian            also check for negative/zero Jacobians (curved
@@ -40,7 +44,8 @@ from nekolight import (banner, read_nmsh, extrude_2d, validate_zones,
                        validate_curves, pos_of_elid_map, merged_vertex_ids,
                        face_multiplicity, count_edges, gll_geometry,
                        jacobian_dets, facet_normals, facet_gll_mask,
-                       write_zone_indices_fld, CurveError, MAX_ZLBLS)
+                       write_zone_indices_fld, point_coordinate_conflicts,
+                       midside_conflicts, CurveError, MAX_ZLBLS)
 
 AXIS_TOL = 1e-3          # Neko's axis_alignment_tol
 CHUNK = 1 << 18
@@ -103,6 +108,33 @@ def main():
         hexmesh = mesh
 
     xyz = hexmesh.elems['v']['xyz']
+
+    # ---- structural consistency Neko does not check itself ----
+    ncf, gap, first_id = point_coordinate_conflicts(hexmesh.elems)
+    if ncf:
+        failed = True
+        log('        Error: %d point id(s) carry more than one coordinate '
+            '(first: id %d, max gap %g).  Neko keeps whichever occurrence '
+            'each rank reads first, so the geometry would depend on the '
+            'number of ranks.' % (ncf, first_id, gap))
+    ne, ndis, mgap, nmix, mmgap = midside_conflicts(hexmesh.elems,
+                                                    hexmesh.curves, pos_of_elid)
+    if ndis:
+        failed = True
+        log('        Error: midside points disagree across %d of %d curved '
+            'edges (max gap %g) -- the neighbouring elements would not share '
+            'their edge geometry (a crack Neko does not detect).'
+            % (ndis, ne, mgap))
+    if nmix and mmgap > 0.0:
+        failed = True
+        log('        Error: %d edge(s) are curved in one element and straight '
+            'in a neighbour (midside point up to %g from the chord midpoint) '
+            '-- a geometric crack Neko does not detect.' % (nmix, mmgap))
+    elif nmix:
+        log('        note: %d edge(s) curved in one element and straight in a '
+            'neighbour, but the midside point is the chord midpoint '
+            '(harmless)' % nmix)
+
     # Neko prints glmin/glmax of the GLL coordinates: the corner hull plus
     # whatever the curved elements bulge out to
     lo, hi = xyz.reshape(-1, 3).min(axis=0), xyz.reshape(-1, 3).max(axis=0)

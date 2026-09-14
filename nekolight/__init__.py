@@ -25,7 +25,8 @@ from .topology import (facet_table, pos_of_elid_map, dedup_points,
                        periodic_replace_merge, create_periodic_ids,
                        merged_vertex_ids,
                        compress_ids, face_multiplicity, count_edges, skin,
-                       dual_graph)
+                       dual_graph, point_coordinate_conflicts,
+                       midside_conflicts, EDGE_CYC)
 from .geometry import (gll_xyz, jacobian_gll, jacobian_dets, min_jacobian,
                        facet_normals, facet_gll_mask, apply_curves,
                        gll_geometry, CurveError, GLL3)

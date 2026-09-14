@@ -347,6 +347,9 @@ if os.path.exists(box_ref):
 else:
     skip('turb_channel box', 'not found')
 
+cyl = os.path.join(NEKO, 'examples', 'cylinder', 'cylinder.nmsh')
+cyl2d = os.path.join(NEKO, 'examples', '2d_cylinder', '2d_cylinder.nmsh')
+
 # ---- T2b: checker counts vs closed forms on boxes --------------------------
 print('[T2b] mesh_checker: closed-form point/face/edge counts of boxes')
 nx, ny, nz = 3, 4, 5
@@ -400,6 +403,46 @@ write_nmsh(wpath('bulge.nmsh'), bm.elems, (bm.zones,), cv)
 rc, out = tool('mesh_checker.py', 'bulge.nmsh')
 report('bounding box includes the curved geometry (y min = -0.75)',
        rc == 0 and re.search(r'y\s+-0\.75\s', out) is not None, out[-300:])
+
+# ---- T2c: structural defects Neko does not detect --------------------------
+print('[T2c] mesh_checker: point-id/coordinate and shared-edge midside checks')
+bm = read_nmsh(wpath('box_000.nmsh'))
+e2 = bm.elems.copy()
+e2['v']['xyz'][0, 6, 0] += 1e-3        # interior corner (shared), same id
+write_nmsh(wpath('idconf.nmsh'), e2, (bm.zones,), bm.curves)
+rc, out = tool('mesh_checker.py', 'idconf.nmsh')
+report('point id with two coordinates -> error',
+       rc == 1 and 'more than one coordinate' in out, out[-300:])
+if os.path.exists(cyl):
+    from nekolight import EDGE_CYC  # noqa: E402
+    cm = read_nmsh(cyl)
+    cpos = np.empty(cm.nelv + 1, dtype=np.int64)
+    cpos[cm.elems['id']] = np.arange(cm.nelv)
+    vv = cm.elems['v']['idx'].astype(np.int64)
+    mult = {}
+    for e in range(cm.nelv):
+        for kk in range(12):
+            key = tuple(sorted(vv[e, EDGE_CYC[kk]]))
+            mult[key] = mult.get(key, 0) + 1
+    # a curved edge shared by at least two elements
+    rec, k = next((i, kk) for i in range(cm.curves.shape[0])
+                  for kk in range(12) if cm.curves['type'][i, kk] == 4
+                  and mult[tuple(sorted(vv[cpos[cm.curves['e'][i]],
+                                           EDGE_CYC[kk]]))] >= 2)
+    cv = cm.curves.copy()
+    cv['data'][rec, k, 1] += 1e-4                   # one side of a shared edge
+    write_nmsh(wpath('midconf.nmsh'), cm.elems, (cm.zones,), cv)
+    rc, out = tool('mesh_checker.py', 'midconf.nmsh')
+    report('midside points disagreeing across a shared edge -> error',
+           rc == 1 and 'midside points disagree' in out, out[-300:])
+    cv = cm.curves.copy()
+    cv['type'][rec, k] = 0                          # curved here, straight there
+    write_nmsh(wpath('mixed.nmsh'), cm.elems, (cm.zones,), cv)
+    rc, out = tool('mesh_checker.py', 'mixed.nmsh')
+    report('edge curved in one element only -> error',
+           rc == 1 and 'straight in a neighbour' in out, out[-300:])
+    rc, out = tool('mesh_checker.py', cyl)
+    report('cylinder mesh itself passes both checks', rc == 0, out[-300:])
 
 # ---- T3: checker corpus sweep ---------------------------------------------
 print('[T3] mesh_checker: every shipped .nmsh (2D and 3D)')
@@ -579,7 +622,6 @@ else:
 
 # ---- T5b: 2D mesh through prepart -----------------------------------------
 print('[T5b] prepart: 2D (quad) mesh stays 2D')
-cyl2d = os.path.join(NEKO, 'examples', '2d_cylinder', '2d_cylinder.nmsh')
 if os.path.exists(cyl2d):
     csrc = read_nmsh(cyl2d)
     for be in [b for b in backends if b != 'grid']:
@@ -856,7 +898,6 @@ report('facet normals point outward on the unit cube',
 
 # ---- T10: meshview exports ------------------------------------------------
 print('[T10] meshview: .vtu export (3D, 2D slab, --curved)')
-cyl = os.path.join(NEKO, 'examples', 'cylinder', 'cylinder.nmsh')
 for name, path, extra in (('hemi', hemi_ref, []),
                           ('2d_cylinder slab', cyl2d, []),
                           ('cylinder --curved', cyl, ['--curved'])):
