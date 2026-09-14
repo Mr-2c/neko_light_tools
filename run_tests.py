@@ -1124,8 +1124,8 @@ if have('meshio'):
         ref = meshio.read(os.path.join(GM, 'box8_%s.msh' % v))
         idx = g.node_index()
         hx = np.concatenate([b.nodes for b in g.blocks if b.etype == 5])
-        ok = ok and np.allclose(g.xyz[idx[g.node_tags]], ref.points) and \
-            np.array_equal(np.sort(idx[hx], axis=0), np.sort(ref.cells_dict['hexahedron'], axis=0))
+        ok = ok and np.allclose(g.xyz[idx(g.node_tags)], ref.points) and \
+            np.array_equal(np.sort(idx(hx), axis=0), np.sort(ref.cells_dict['hexahedron'], axis=0))
     report('gmsh reader agrees with meshio on all four format variants', ok)
 else:
     skip('gmsh2nmsh mirrored / meshio comparison', 'meshio not installed')
