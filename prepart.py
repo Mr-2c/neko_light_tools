@@ -264,9 +264,14 @@ def report_cuts(grid, cuts):
             log('        %s cuts: %s' % (names[axis],
                                         ' '.join('%.6g' % v for v in flat)))
         elif flat.size <= 24:
+            nx, ny = int(grid[0]), int(grid[1])
             for i, row in enumerate(c):
-                log('        %s cuts (%s-block %d): %s'
-                    % (names[axis], names[axis - 1], i,
+                if axis == 1 or ny == 1:
+                    where = 'x-block %d' % (i if axis == 1 else i // ny)
+                else:
+                    where = 'x-block %d, y-block %d' % (i // ny, i % ny)
+                log('        %s cuts (%s): %s'
+                    % (names[axis], where,
                        ' '.join('%.6g' % v for v in row if np.isfinite(v))))
         else:
             log('        %s cuts: %d values in [%.6g, %.6g] (vary per %s '

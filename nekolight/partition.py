@@ -467,8 +467,10 @@ def grid_partition(cent, nelv, grid, log=_noop):
             for iz, bx in enumerate(boxes):
                 part[bx] = base + iz
     for name, c in (('x', cut_x), ('y', cut_y), ('z', cut_z)):
-        c = np.asarray(c).reshape(-1, c.shape[-1]) if np.asarray(c).ndim > 1 \
-            else np.asarray(c)[None, :]
+        c = np.asarray(c)
+        if c.size == 0:                 # a single slab along this axis
+            continue
+        c = c.reshape(-1, c.shape[-1]) if c.ndim > 1 else c[None, :]
         dup = 0
         for row in c:
             row = row[np.isfinite(row)]

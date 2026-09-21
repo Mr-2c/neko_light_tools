@@ -599,6 +599,14 @@ if os.path.exists(tgv):
     rc, _ = tool('prepart.py', tgv, 11, 'gridbad.nmsh', '--grid', '2,3,2')
     report('grid: nparts != NX*NY*NZ refused',
            rc != 0 and not os.path.exists(wpath('gridbad.nmsh')))
+    # grids with a single slab along one or two axes (regression: the cut
+    # report used to fail on the empty cut arrays)
+    for g, P in (('4,1,1', 4), ('1,3,1', 3), ('2,1,3', 6), ('1,1,5', 5)):
+        rc, out = tool('prepart.py', tgv, 'grid1.nmsh', '--grid', g)
+        if rc == 0:
+            prepart_contract('grid %s' % g, tsrc, wpath('grid1.nmsh'), P)
+        else:
+            report('grid %s runs' % g, False, out[-300:])
 else:
     skip('tgv/512', 'not found')
 
