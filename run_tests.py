@@ -1236,10 +1236,38 @@ report('permute: between two prepart outputs (7 parts -> grid 2,1,3)',
        np.array_equal(PB.elems['v']['xyz'][perm2], PC.elems['v']['xyz']))
 
 
-def write_fld(path, lx, ly, lz, wd, rdcode, ids, time=1.25, step=7):
-    """A field file laid out as fld_file_write does (synthetic values)."""
+def gll_coords(mesh, lx, ly, lz, deform=None):
+    """(NE, gdim, lxyz) node coordinates on the mesh elements: multilinear
+    from the corners (as Neko's dofmap does), node i fastest, then an
+    optional point-wise deformation of the whole set (as user_mesh_setup)."""
+    gdim = 2 if lz == 1 else 3
+    nv = 8 if gdim == 3 else 4
+    swap = [0, 1, 3, 2, 4, 5, 7, 6] if gdim == 3 else [0, 1, 3, 2]
+    xc = np.asarray(mesh.elems['v']['xyz'], dtype=np.float64)[:, swap, :gdim]
+    R = [a.ravel(order='F') for a in
+         np.meshgrid(*[np.linspace(-1, 1, n) for n in (lx, ly, lz)[:gdim]], indexing='ij')]
+    W = np.ones((nv, lx * ly * lz))
+    for c in range(nv):
+        for d in range(gdim):
+            W[c] *= (1 + R[d]) / 2 if (c >> d) & 1 else (1 - R[d]) / 2
+    x = np.einsum('ecd,cn->edn', xc, W)
+    return deform(x) if deform else x
+
+
+def DEFORM(x):
+    """A point-wise, non-affine deformation (same map for every element)."""
+    y = x.copy()
+    y[:, 0] += 0.1 * np.sin(3.0 * x[:, 1])
+    y[:, 1] = 2.0 * x[:, 1] - 0.7
+    return y
+
+
+def write_fld(path, lx, ly, lz, wd, rdcode, ids, time=1.25, step=7, mesh=None, deform=None):
+    """A field file laid out as fld_file_write does (synthetic values; the X
+    block holds the mesh coordinates when a mesh is given)."""
     gdim = 2 if lz == 1 else 3
     lxyz = lx * ly * lz
+    NE = len(ids)
     hdr = ('#std %1d %2d %2d %2d %10d %10d %20.13E %9d %6d %6d %-10s'
            % (wd, lx, ly, lz, NE, NE, time, step, 1, 1, rdcode)).encode().ljust(132, b' ')
     groups = ([('X', gdim)] * ('X' in rdcode) + [('U', gdim)] * ('U' in rdcode)
@@ -1251,7 +1279,10 @@ def write_fld(path, lx, ly, lz, wd, rdcode, ids, time=1.25, step=7):
         f.write(hdr); np.array([6.54321], dtype='<f4').tofile(f)
         np.asarray(ids, dtype='<i4').tofile(f)
         for g, nc in groups:
-            rng.standard_normal((NE, nc * lxyz)).astype(ft).tofile(f)
+            if g == 'X' and mesh is not None:
+                gll_coords(mesh, lx, ly, lz, deform).reshape(NE, -1).astype(ft).tofile(f)
+            else:
+                rng.standard_normal((NE, nc * lxyz)).astype(ft).tofile(f)
         if gdim == 3:
             for g, nc in groups:
                 rng.standard_normal((NE, 2 * nc)).astype('<f4').tofile(f)
@@ -1275,6 +1306,7 @@ def write_chkp(path, gdim, lx, opt, rp, ale_tail=0):
 
 
 def check_permuted(src_path, dst_path, layout, perm, idx_expected=None):
+    NE = perm.size
     src = np.memmap(src_path, dtype=np.uint8, mode='r')
     dst = np.memmap(dst_path, dtype=np.uint8, mode='r')
     if len(src) != len(dst):
@@ -1293,17 +1325,64 @@ def check_permuted(src_path, dst_path, layout, perm, idx_expected=None):
 
 
 os.makedirs(wpath('pf_out'), exist_ok=True)
+# a 2D mesh pair (Neko's 2d_cylinder example, prepart into 5 parts) for the 2D field files
+MESHES = {3: (wpath('pbox.nmsh'), wpath('pbox7.nmsh'), PA, PB, perm)}
+if os.path.exists(cyl2d):
+    rc, _ = tool('prepart.py', cyl2d, 5, '-o', wpath('pcyl5.nmsh'), '--no-stats')
+    QA, QB = read_nmsh(cyl2d), read_nmsh(wpath('pcyl5.nmsh'))
+    perm_q = element_permutation(cyl2d, wpath('pcyl5.nmsh'))
+    report('permute: 2D element matching (2d_cylinder -> 5 parts) is a bijection with equal geometry',
+           rc == 0 and QA.gdim == 2 and np.array_equal(np.sort(perm_q), np.arange(QA.nelv)) and
+           np.array_equal(QA.elems['v']['xyz'][perm_q], QB.elems['v']['xyz']))
+    MESHES[2] = (cyl2d, wpath('pcyl5.nmsh'), QA, QB, perm_q)
+else:
+    skip('permute_fields on 2D field files', '2d_cylinder not found')
 for name, kw in (('f3d.f00001', dict(lx=6, ly=6, lz=6, wd=8, rdcode='XUPTS02')),
                  ('f3dsp.f00002', dict(lx=5, ly=5, lz=5, wd=4, rdcode='UP')),
-                 ('f2d.f00003', dict(lx=4, ly=4, lz=1, wd=8, rdcode='XUPS01'))):
-    write_fld(wpath(name), ids=PA.elems['id'], **kw)
-    rc, out = tool('permute_fields.py', wpath('pbox.nmsh'), wpath('pbox7.nmsh'), '-o',
-                   wpath('pf_out'), wpath(name), '--force')
+                 ('f3dsp4.f00004', dict(lx=4, ly=4, lz=4, wd=4, rdcode='XU')),
+                 ('f2d.f00003', dict(lx=4, ly=4, lz=1, wd=8, rdcode='XUPS01')),
+                 ('f2dsp.f00005', dict(lx=3, ly=3, lz=1, wd=4, rdcode='XUP'))):
+    if kw['lz'] == 1 and 2 not in MESHES:
+        continue
+    m_src, m_dst, MA, MB, pm = MESHES[2 if kw['lz'] == 1 else 3]
+    write_fld(wpath(name), ids=MA.elems['id'], mesh=MA, **kw)
+    rc, out = tool('permute_fields.py', m_src, m_dst, '-o', wpath('pf_out'), wpath(name), '--force')
     ok = rc == 0 and check_permuted(wpath(name), wpath('pf_out/' + name), fld_layout(wpath(name)),
-                                    perm, PB.elems['id'])
+                                    pm, MB.elems['id'])
+    if 'X' in kw['rdcode']:
+        ok = ok and 'coordinates agree' in out
     lay = fld_layout(wpath(name))
     report('permute_fields: %s (%s, %d-byte, %dD, %d blocks) is an exact record gather'
            % (name, kw['rdcode'], kw['wd'], lay.gdim, len(lay.blocks)), ok, out[-300:])
+# a run that deformed the mesh (user_mesh_setup): absolute corners differ, shared corners agree
+for name, kw in (('fdef3.f00001', dict(lx=5, ly=5, lz=5, wd=8, rdcode='XUP')),
+                 ('fdef2.f00001', dict(lx=4, ly=4, lz=1, wd=4, rdcode='XU'))):
+    if kw['lz'] == 1 and 2 not in MESHES:
+        continue
+    m_src, m_dst, MA, MB, pm = MESHES[2 if kw['lz'] == 1 else 3]
+    write_fld(wpath(name), ids=MA.elems['id'], mesh=MA, deform=DEFORM, **kw)
+    rc, out = tool('permute_fields.py', m_src, m_dst, '-o', wpath('pf_out'), wpath(name), '--force')
+    ok = rc == 0 and 'deformed at run time' in out and check_permuted(
+        wpath(name), wpath('pf_out/' + name), fld_layout(wpath(name)), pm, MB.elems['id'])
+    report('permute_fields: %s written on a run-time deformed mesh (%dD, %d-byte) passes the '
+           'shared-corner check' % (name, 2 if kw['lz'] == 1 else 3, kw['wd']), ok, out[-300:])
+# a 2D field file with a 3D mesh (and vice versa) is refused
+write_fld(wpath('fmix.f00001'), ids=PA.elems['id'], lx=4, ly=4, lz=1, wd=8, rdcode='XU')
+rc, out = tool('permute_fields.py', wpath('pbox.nmsh'), wpath('pbox7.nmsh'), '-o', wpath('pf_out'),
+               wpath('fmix.f00001'), '--force')
+report('permute_fields: a 2D field file with a 3D mesh is refused', rc != 0 and '3D mesh' in out,
+       out[-300:])
+# a file written on the target ordering, deformed or not, is caught although the idx column
+# (1..N in both meshes) cannot tell the orderings apart
+for deform in (None, DEFORM):
+    write_fld(wpath('forder.f00001'), lx=4, ly=4, lz=4, wd=8, rdcode='XUP', ids=PB.elems['id'],
+              mesh=PB, deform=deform)
+    rc, out = tool('permute_fields.py', wpath('pbox.nmsh'), wpath('pbox7.nmsh'), '-o',
+                   wpath('pf_out'), wpath('forder.f00001'), '--force')
+    report('permute_fields: a file in the target ordering (idx 1..N in both meshes%s) is refused'
+           % (', deformed mesh' if deform else ''),
+           np.array_equal(PA.elems['id'], PB.elems['id']) and rc != 0 and 'reversed' in out
+           and 'cannot tell' in out, out[-300:])
 for name, opt, rp, tail in (('a.chkp', 1 | 2 | 4 | 8 | 16, 8, 0), ('b.chkp', 0, 4, 0),
                             ('c.chkp', 1 | 4 | 8 | 32, 8, 37)):
     write_chkp(wpath(name), 3, 5, opt, rp, tail)
@@ -1341,6 +1420,48 @@ rc, out = tool('permute_fields.py', wpath('pbox.nmsh'), wpath('other.nmsh'), '-o
 report('permute_fields: two different meshes are refused', rc != 0, out[-300:])
 rc, out = tool('permute_fields.py', wpath('pbox.nmsh'), wpath('pbox7.nmsh'), '-o', WORK, wpath('b.chkp'))
 report('permute_fields: overwriting the input is refused', rc != 0 and 'overwrite' in out, out[-200:])
+# guards added after review
+with open(wpath('stale.chkp'), 'wb') as f:
+    f.write(open(wpath('a.chkp'), 'rb').read() + b'\0' * 12345)
+rc, out = tool('permute_fields.py', wpath('pbox.nmsh'), wpath('pbox7.nmsh'), '-o', wpath('pf_out'),
+               wpath('stale.chkp'), '--force')
+ok = rc == 0 and 'stale byte' in out and open(wpath('pf_out/stale.chkp'), 'rb').read() == \
+    open(wpath('pf_out/a.chkp'), 'rb').read()
+report('permute_fields: stale bytes after a checkpoint layout are dropped (8-byte reals assumed)',
+       ok, out[-300:])
+with open(wpath('stale.f00001'), 'wb') as f:
+    f.write(open(wpath('f3d.f00001'), 'rb').read() + b'\0' * 777)
+rc, out = tool('permute_fields.py', wpath('pbox.nmsh'), wpath('pbox7.nmsh'), '-o', wpath('pf_out'),
+               wpath('stale.f00001'), '--force')
+ok = rc == 0 and 'stale byte' in out and open(wpath('pf_out/stale.f00001'), 'rb').read() == \
+    open(wpath('pf_out/f3d.f00001'), 'rb').read()
+report('permute_fields: stale bytes after a field-file layout are dropped', ok, out[-300:])
+write_chkp(wpath('ale.chkp'), 3, 5, 1 | 4 | 8 | 32, 8, 37)
+rc, out = tool('permute_fields.py', wpath('pbox.nmsh'), wpath('pbox7.nmsh'), '-o', wpath('pf_out'),
+               wpath('ale.chkp'), '--force', '--rp', 4)
+rc2, out2 = tool('permute_fields.py', wpath('pbox.nmsh'), wpath('pbox7.nmsh'), '-o', wpath('pf_out'),
+                 wpath('ale.chkp'), '--force')
+report('permute_fields: ALE checkpoint: wrong --rp refused, real kind inferred from the tail bound',
+       rc != 0 and rc2 == 0 and '8-byte reals (inferred' in out2, out[-200:] + out2[-200:])
+os.makedirs(wpath('pf_in'), exist_ok=True)
+shutil.copyfile(wpath('b.chkp'), wpath('pf_in/b.chkp'))
+os.symlink(wpath('pf_in'), wpath('pf_link'))
+rc, out = tool('permute_fields.py', wpath('pbox.nmsh'), wpath('pbox7.nmsh'), '-o', wpath('pf_link'),
+               wpath('pf_in/b.chkp'), '--force')
+report('permute_fields: a symlinked output directory equal to the input is refused',
+       rc != 0 and 'overwrite' in out and open(wpath('pf_in/b.chkp'), 'rb').read() == open(wpath('b.chkp'), 'rb').read(),
+       out[-200:])
+rc, out = tool('permute_fields.py', wpath('pbox.nmsh'), wpath('pbox7.nmsh'), '-o', wpath('pf_out'),
+               wpath('b.chkp'), wpath('pf_in/b.chkp'), '--force')
+report('permute_fields: two inputs with the same name are refused', rc != 0 and 'both be written' in out,
+       out[-200:])
+with open(wpath('series0.nek5000'), 'w') as f:
+    f.write('filetemplate:         series%01d.f%05d\nfirsttimestep:     0\nnumtimesteps:     3\n')
+shutil.copyfile(wpath('f3d.f00001'), wpath('series0.f00001'))
+rc, out = tool('permute_fields.py', wpath('pbox.nmsh'), wpath('pbox7.nmsh'), '-o', wpath('pf_out'),
+               wpath('series0.nek5000'), wpath('series0.f00001'), '--force')
+report('permute_fields: .nek5000 copied and missing series members reported',
+       rc == 0 and os.path.exists(wpath('pf_out/series0.nek5000')) and 'not present' in out, out[-300:])
 GMF = os.path.join(HERE, 'tests', 'neko_fields')
 if os.path.isdir(GMF):
     # real Neko output: a 4x4x4 periodic box run on the original mesh (1 rank)
@@ -1393,6 +1514,14 @@ if os.path.isdir(GMF):
         report('permute_fields: real Neko checkpoint (%d blocks) agrees to solver tolerance (max '
                'diff %.1e), unpermuted %.1e' % (len(ca.blocks), max(v[0] for v in dc.values()), dc['u'][1]),
                ok, str(dc))
+        rc, out = tool('permute_fields.py', os.path.join(GMF, 'box64_g211.nmsh'), os.path.join(GMF, 'box64.nmsh'),
+                       '-o', wpath('real_out'), os.path.join(GMF, 'A', 'field0.f00000'), '--force')
+        report('permute_fields: swapped mesh arguments are caught by the coordinate check',
+               rc != 0 and 'reversed' in out, out[-300:])
+        rc, out = tool('permute_fields.py', os.path.join(GMF, 'box64.nmsh'), os.path.join(GMF, 'box64_g211.nmsh'),
+                       '-o', wpath('real_out'), os.path.join(GMF, 'B', 'field0.f00000'), '--force')
+        report('permute_fields: a file already in the target order is refused as source',
+               rc != 0 and 'not written on that mesh ordering' in out, out[-300:])
     else:
         report('permute_fields: real Neko files convert', False, out[-400:])
 else:

@@ -279,9 +279,11 @@ cannot read files written on another ordering of the same mesh; the
 `initial_condition` `"field"` type copies element k of the file into element
 k of the mesh, and `restart_file` does the same.  `permute_fields.py` fixes
 the files instead of the run: it matches the elements of the two mesh files
-(by point ids, which `prepart` keeps, verified by corner coordinates; by
-centroids for files that do not share ids) and gathers the fixed-size
-per-element records of every block into the target order.  Nothing inside
+(by point ids, which `prepart` and Neko's own mesh writer keep, verified
+corner by corner; by centroids for files that do not share ids, such as
+`create_periodic_zones` output or two independent conversions) and gathers
+the fixed-size per-element records of every block into the target order.
+Nothing inside
 a record changes; headers, the `tlag/dtlag` block and the ALE tracker
 arrays are copied verbatim; the `idx` column of a field file receives the
 element ids of the target mesh; the `.nek5000` series index is copied.
@@ -306,14 +308,28 @@ Neko restarted from a permuted checkpoint agrees with the restart from the
 run's own checkpoint to the same tolerance, while the unpermuted files are
 off by order one.
 
-Memory is one chunk: the source is memory-mapped and each output chunk
-gathers its records in ascending source order while the output is written
-sequentially, so a 41-million-element checkpoint is processed with a few
-hundred MB.  The scattered reads cost throughput on parallel file systems;
-`--scratch DIR` switches to two sequential passes through bucket files
-(scratch space of the file size).  The work is a pure byte permutation and
-would parallelise over disjoint destination ranges; a single process is
-I/O-bound already.
+Memory: matching the two meshes costs about 40 bytes per element (hashed
+point-id keys; a KD-tree of centroids for `--match centroids`) plus the
+page cache of the mesh files; the record gather holds two chunks
+(`--chunk-mb`, default 512 MB) and lets the operating system cache the
+memory-mapped source, so a 41-million-element checkpoint is processed with
+about 2 GB of process memory.  The scattered reads cost throughput on
+parallel file systems; `--scratch DIR` switches to two sequential passes
+through at most 512 bucket files (three chunks of memory, scratch space of
+the file size).  The work is a pure byte permutation and would parallelise
+over disjoint destination ranges; a single process is I/O-bound already.
+Besides the element match, the tool checks a field file's `idx` column
+against the source mesh's element ids and, when the file carries
+coordinates, its element corners against the source mesh: they must
+coincide with the mesh corners or, when the run deformed the mesh
+(`user_mesh_setup`), at least agree wherever the mesh shares a corner
+between two elements, which holds for any deformation and fails for another
+element ordering -- this is what catches swapped mesh arguments (the
+Taylor-Green case, which rescales its mesh to [-pi, pi]^3 at run time,
+exercises this path).  Checkpoints carry no element identity, so pass a
+coordinate-carrying field file of the same run alongside when in doubt.
+Files with stale bytes after their layout (Neko does not truncate output
+files it rewrites) are accepted and the bytes dropped.
 
 ## Memory
 

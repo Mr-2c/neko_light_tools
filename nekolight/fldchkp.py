@@ -42,8 +42,9 @@ class FldLayout(NamedTuple):
     rdcode: str
     gdim: int
     n_scalars: int
-    blocks: list       # [Block], in file order, covering the whole file
-    size: int
+    blocks: list       # [Block], in file order, covering the layout
+    size: int          # bytes covered by the layout
+    trailing: int      # stale bytes after the layout (dropped)
 
 
 def fld_layout(path):
@@ -108,12 +109,15 @@ def fld_layout(path):
             rb = 2 * nc * 4
             blocks.append(Block(name + ' min/max', off, rb, rb * nelgv))
             off += rb * nelgv
-    if off != size:
+    if off > size:
         sys.exit('Error: %s: the header (lx=%d ly=%d lz=%d, %d elements, word '
-                 'size %d, rdcode %r) implies %d bytes but the file has %d'
-                 % (path, lx, ly, lz, nelgv, wdsize, rdcode, off, size))
+                 'size %d, rdcode %r) implies %d bytes but the file has only %d '
+                 '(truncated?)' % (path, lx, ly, lz, nelgv, wdsize, rdcode, off, size))
+    # Neko opens output files without truncation, so a re-run into an
+    # existing directory can leave stale bytes after the layout; Neko reads
+    # by offset and never sees them
     return FldLayout(hdr, wdsize, lx, ly, lz, nelgv, time, step, rdcode, gdim,
-                     n_s, blocks, size)
+                     n_s, blocks, off, size - off)
 
 
 class ChkpLayout(NamedTuple):
@@ -125,8 +129,22 @@ class ChkpLayout(NamedTuple):
     time: float
     rp: int
     blocks: list
-    size: int
+    size: int          # bytes covered by the layout (ALE trackers included)
+    trailing: int      # stale bytes after the layout (dropped)
     flags: dict
+    rp_note: str       # how rp was decided
+
+
+CHKP_NAMES = {
+    'lag': ['ulag1', 'ulag2', 'vlag1', 'vlag2', 'wlag1', 'wlag2'],
+    'scalar': ['s'],
+    'dtlag': ['tlag/dtlag'],
+    'abvel': ['abx1', 'abx2', 'aby1', 'aby2', 'abz1', 'abz2'],
+    'scalarlag': ['slag1', 'slag2', 'abs1', 'abs2'],
+    'ale': ['msh_x', 'msh_y', 'msh_z', 'wm_x', 'wm_y', 'wm_z', 'wm_x_lag1',
+            'wm_x_lag2', 'wm_y_lag1', 'wm_y_lag2', 'wm_z_lag1', 'wm_z_lag2',
+            'Blag', 'Blaglag'],
+}
 
 
 def chkp_layout(path, rp=None):
@@ -135,10 +153,12 @@ def chkp_layout(path, rp=None):
     element-major blocks of lxyz reals each -- u, v, w, p; with bit 0 the six
     velocity lags; bit 1 the scalar; bit 2 the 160-byte tlag/dtlag block
     (not per element); bit 3 the six abx/aby/abz; bit 4 the two scalar lags
-    and abs1, abs2; bit 5 the fourteen ALE blocks followed by tracker
-    arrays of unrecorded length (copied verbatim to the end of file).  The
-    real kind ``rp`` (4 or 8 bytes) is not stored; it is inferred from the
-    file size unless given."""
+    and abs1, abs2; bit 5 the fourteen ALE blocks followed by the tracker
+    arrays (a few reals per body, copied verbatim).  The real kind ``rp``
+    (4 or 8 bytes) is not stored: it is inferred from the file size -- an
+    exact fit wins; with stale bytes after the layout (Neko never truncates
+    an output file) 8-byte reals are assumed unless ``rp`` is given.  For an
+    ALE file the tracker tail must be shorter than one element record."""
     size = os.path.getsize(path)
     with open(path, 'rb') as f:
         hdr = f.read(CHKP_HEADER)
@@ -153,39 +173,48 @@ def chkp_layout(path, rp=None):
     flags = dict(lag=bool(opt & 1), scalar=bool(opt & 2), dtlag=bool(opt & 4),
                  abvel=bool(opt & 8), scalarlag=bool(opt & 16), ale=bool(opt & 32))
     names = ['u', 'v', 'w', 'p']
-    if flags['lag']:
-        names += ['ulag1', 'ulag2', 'vlag1', 'vlag2', 'wlag1', 'wlag2']
-    if flags['scalar']:
-        names += ['s']
-    if flags['dtlag']:
-        names += ['tlag/dtlag']
-    if flags['abvel']:
-        names += ['abx1', 'abx2', 'aby1', 'aby2', 'abz1', 'abz2']
-    if flags['scalarlag']:
-        names += ['slag1', 'slag2', 'abs1', 'abs2']
-    if flags['ale']:
-        names += ['msh_x', 'msh_y', 'msh_z', 'wm_x', 'wm_y', 'wm_z',
-                  'wm_x_lag1', 'wm_x_lag2', 'wm_y_lag1', 'wm_y_lag2',
-                  'wm_z_lag1', 'wm_z_lag2', 'Blag', 'Blaglag']
+    for key in ('lag', 'scalar', 'dtlag', 'abvel', 'scalarlag', 'ale'):
+        if flags[key]:
+            names += CHKP_NAMES[key]
     nblk = sum(1 for n in names if n != 'tlag/dtlag')
     fixed = CHKP_HEADER + (160 if flags['dtlag'] else 0)
+
+    def fit(r):
+        """(valid, tail) for real kind r: tail = bytes after the blocks."""
+        tail = size - (fixed + nblk * nelgv * lxyz * r)
+        if tail < 0:
+            return False, tail
+        if flags['ale']:
+            return tail % r == 0 and tail < lxyz * r, tail
+        return True, tail
+
+    candidates = [r for r in (8, 4) if fit(r)[0]]
     if rp is None:
-        fits = [r for r in (8, 4) if fixed + nblk * nelgv * lxyz * r
-                + (0 if not flags['ale'] else 0) <= size
-                and (flags['ale'] or fixed + nblk * nelgv * lxyz * r == size)]
-        if flags['ale'] and len(fits) > 1:
-            sys.exit('Error: %s: ALE checkpoint; the real kind cannot be '
-                     'inferred from the file size, give --rp 8 or --rp 4' % path)
-        if len(fits) != 1:
+        exact = [r for r in candidates if fit(r)[1] == 0 or flags['ale']]
+        if flags['ale'] and len(exact) > 1:
+            sys.exit('Error: %s: ALE checkpoint whose size fits both real kinds; '
+                     'give --rp 8 or --rp 4' % path)
+        if exact:
+            rp, rp_note = exact[0], 'inferred from the file size'
+        elif candidates:
+            rp, rp_note = 8, ('assumed (the file is longer than any layout: %d '
+                              'stale bytes with 8-byte reals; --rp overrides)'
+                              % fit(8)[1])
+        else:
             sys.exit('Error: %s: no real kind (4 or 8 bytes) makes the header '
                      '(%d elements, gdim %d, lx %d, optional_fields %d -> %d '
                      'blocks) fit the file size %d' % (path, nelgv, gdim, lx, opt,
                                                         nblk, size))
-        rp = fits[0]
-    expect = fixed + nblk * nelgv * lxyz * rp
-    if (not flags['ale'] and expect != size) or expect > size:
-        sys.exit('Error: %s: with %d-byte reals the layout needs %d bytes, the '
-                 'file has %d' % (path, rp, expect, size))
+    else:
+        rp_note = 'given'
+        ok, tail = fit(rp)
+        if not ok:
+            sys.exit('Error: %s: with %d-byte reals the layout needs %d bytes%s, '
+                     'the file has %d' % (path, rp, fixed + nblk * nelgv * lxyz * rp,
+                                          ' plus a tracker tail shorter than one '
+                                          'element record' if flags['ale'] else '',
+                                          size))
+    tail = fit(rp)[1]
     blocks = [Block('header', 0, 0, CHKP_HEADER)]
     off = CHKP_HEADER
     for n in names:
@@ -194,9 +223,12 @@ def chkp_layout(path, rp=None):
         else:
             rb = lxyz * rp
             blocks.append(Block(n, off, rb, rb * nelgv)); off += rb * nelgv
-    if off < size:
-        blocks.append(Block('ALE trackers', off, 0, size - off))
-    return ChkpLayout(hdr, nelgv, gdim, lx, opt, time, rp, blocks, size, flags)
+    trailing = tail
+    if flags['ale']:
+        blocks.append(Block('ALE trackers', off, 0, tail)); off += tail
+        trailing = 0
+    return ChkpLayout(hdr, nelgv, gdim, lx, opt, time, rp, blocks, off, trailing,
+                      flags, rp_note)
 
 
 def read_fld_idx(path, layout):
