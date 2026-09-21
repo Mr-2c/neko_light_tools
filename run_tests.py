@@ -1214,6 +1214,190 @@ if have('meshio'):
     report('gmsh2nmsh: a partly matching periodic surface is refused, not '
            'turned into a wall', rc != 0 and 'no partner' in out, out[-300:])
 
+# ---- T12: permute_fields ------------------------------------------------------
+print('[T12] permute_fields: .fld / .chkp element reordering between mesh orderings')
+from nekolight.fldchkp import fld_layout, chkp_layout   # noqa: E402
+from nekolight.permute import element_permutation      # noqa: E402
+rng = np.random.default_rng(3)
+rc, _ = tool('genmeshbox.py', 0, 1, 0, 1, 0, 1, 6, 5, 4, wpath('pbox.nmsh'))
+rc2, _ = tool('prepart.py', wpath('pbox.nmsh'), 7, '-o', wpath('pbox7.nmsh'), '--no-stats')
+rc3, _ = tool('prepart.py', wpath('pbox.nmsh'), '--grid', '2,1,3', '-o', wpath('pbox213.nmsh'), '--no-stats')
+PA, PB = read_nmsh(wpath('pbox.nmsh')), read_nmsh(wpath('pbox7.nmsh'))
+NE = PA.nelv
+perm = element_permutation(wpath('pbox.nmsh'), wpath('pbox7.nmsh'))
+report('permute: element matching by point ids is a bijection with equal geometry',
+       np.array_equal(np.sort(perm), np.arange(NE)) and
+       np.array_equal(PA.elems['v']['xyz'][perm], PB.elems['v']['xyz']))
+perm_c = element_permutation(wpath('pbox.nmsh'), wpath('pbox7.nmsh'), mode='centroids')
+report('permute: centroid matching agrees with id matching', np.array_equal(perm, perm_c))
+perm2 = element_permutation(wpath('pbox7.nmsh'), wpath('pbox213.nmsh'))
+PC = read_nmsh(wpath('pbox213.nmsh'))
+report('permute: between two prepart outputs (7 parts -> grid 2,1,3)',
+       np.array_equal(PB.elems['v']['xyz'][perm2], PC.elems['v']['xyz']))
+
+
+def write_fld(path, lx, ly, lz, wd, rdcode, ids, time=1.25, step=7):
+    """A field file laid out as fld_file_write does (synthetic values)."""
+    gdim = 2 if lz == 1 else 3
+    lxyz = lx * ly * lz
+    hdr = ('#std %1d %2d %2d %2d %10d %10d %20.13E %9d %6d %6d %-10s'
+           % (wd, lx, ly, lz, NE, NE, time, step, 1, 1, rdcode)).encode().ljust(132, b' ')
+    groups = ([('X', gdim)] * ('X' in rdcode) + [('U', gdim)] * ('U' in rdcode)
+              + [('P', 1)] * ('P' in rdcode) + [('T', 1)] * ('T' in rdcode))
+    ns = int(rdcode[rdcode.index('S') + 1:rdcode.index('S') + 3]) if 'S' in rdcode else 0
+    groups += [('S', 1)] * ns
+    ft = '<f4' if wd == 4 else '<f8'
+    with open(path, 'wb') as f:
+        f.write(hdr); np.array([6.54321], dtype='<f4').tofile(f)
+        np.asarray(ids, dtype='<i4').tofile(f)
+        for g, nc in groups:
+            rng.standard_normal((NE, nc * lxyz)).astype(ft).tofile(f)
+        if gdim == 3:
+            for g, nc in groups:
+                rng.standard_normal((NE, 2 * nc)).astype('<f4').tofile(f)
+
+
+def write_chkp(path, gdim, lx, opt, rp, ale_tail=0):
+    lxyz = lx ** gdim
+    ft = '<f8' if rp == 8 else '<f4'
+    order = (['u', 'v', 'w', 'p'] + ['lag'] * (6 if opt & 1 else 0) + ['s'] * (1 if opt & 2 else 0)
+             + ['dtlag'] * (1 if opt & 4 else 0) + ['ab'] * (6 if opt & 8 else 0)
+             + ['slag'] * (4 if opt & 16 else 0) + ['ale'] * (14 if opt & 32 else 0))
+    with open(path, 'wb') as f:
+        np.array([NE, gdim, lx, opt], dtype='<i4').tofile(f); np.array([0.5], dtype='<f8').tofile(f)
+        for n in order:
+            if n == 'dtlag':
+                rng.standard_normal(20).tofile(f)
+            else:
+                rng.standard_normal((NE, lxyz)).astype(ft).tofile(f)
+        if ale_tail:
+            rng.standard_normal(ale_tail).tofile(f)
+
+
+def check_permuted(src_path, dst_path, layout, perm, idx_expected=None):
+    src = np.memmap(src_path, dtype=np.uint8, mode='r')
+    dst = np.memmap(dst_path, dtype=np.uint8, mode='r')
+    if len(src) != len(dst):
+        return False
+    for b in layout.blocks:
+        s = np.asarray(src[b.offset:b.offset + b.nbytes]); d = np.asarray(dst[b.offset:b.offset + b.nbytes])
+        if b.name == 'idx' and idx_expected is not None:
+            if not np.array_equal(np.frombuffer(d.tobytes(), '<i4'), idx_expected):
+                return False
+        elif b.rec_bytes == 0:
+            if not np.array_equal(d, s):
+                return False
+        elif not np.array_equal(d.reshape(NE, b.rec_bytes), s.reshape(NE, b.rec_bytes)[perm]):
+            return False
+    return True
+
+
+os.makedirs(wpath('pf_out'), exist_ok=True)
+for name, kw in (('f3d.f00001', dict(lx=6, ly=6, lz=6, wd=8, rdcode='XUPTS02')),
+                 ('f3dsp.f00002', dict(lx=5, ly=5, lz=5, wd=4, rdcode='UP')),
+                 ('f2d.f00003', dict(lx=4, ly=4, lz=1, wd=8, rdcode='XUPS01'))):
+    write_fld(wpath(name), ids=PA.elems['id'], **kw)
+    rc, out = tool('permute_fields.py', wpath('pbox.nmsh'), wpath('pbox7.nmsh'), '-o',
+                   wpath('pf_out'), wpath(name), '--force')
+    ok = rc == 0 and check_permuted(wpath(name), wpath('pf_out/' + name), fld_layout(wpath(name)),
+                                    perm, PB.elems['id'])
+    lay = fld_layout(wpath(name))
+    report('permute_fields: %s (%s, %d-byte, %dD, %d blocks) is an exact record gather'
+           % (name, kw['rdcode'], kw['wd'], lay.gdim, len(lay.blocks)), ok, out[-300:])
+for name, opt, rp, tail in (('a.chkp', 1 | 2 | 4 | 8 | 16, 8, 0), ('b.chkp', 0, 4, 0),
+                            ('c.chkp', 1 | 4 | 8 | 32, 8, 37)):
+    write_chkp(wpath(name), 3, 5, opt, rp, tail)
+    extra = ['--rp', str(rp)] if opt & 32 else []
+    rc, out = tool('permute_fields.py', wpath('pbox.nmsh'), wpath('pbox7.nmsh'), '-o',
+                   wpath('pf_out'), wpath(name), '--force', *extra)
+    lay = chkp_layout(wpath(name), rp if opt & 32 else None) if rc == 0 else None
+    ok = rc == 0 and lay.rp == rp and check_permuted(wpath(name), wpath('pf_out/' + name), lay, perm)
+    report('permute_fields: %s (optional_fields %d, rp %d%s) permutes blocks, copies the rest'
+           % (name, opt, rp, ', ALE tail' if tail else ''), ok, out[-300:])
+rc, out = tool('permute_fields.py', wpath('pbox.nmsh'), wpath('pbox7.nmsh'), '-o', wpath('pf_out'),
+               wpath('a.chkp'), wpath('f3d.f00001'), '--force', '--scratch', WORK, '--chunk-mb', '0.01')
+same = rc == 0 and open(wpath('pf_out/a.chkp'), 'rb').read() == open(wpath('pf_out/a.chkp'), 'rb').read()
+ref_a = check_permuted(wpath('a.chkp'), wpath('pf_out/a.chkp'), chkp_layout(wpath('a.chkp')), perm)
+ref_f = check_permuted(wpath('f3d.f00001'), wpath('pf_out/f3d.f00001'), fld_layout(wpath('f3d.f00001')),
+                       perm, PB.elems['id'])
+report('permute_fields: two-pass --scratch method gives the same files, tiny chunks',
+       rc == 0 and ref_a and ref_f and not [x for x in os.listdir(WORK) if x.startswith('bucket_')],
+       out[-300:])
+# error paths
+write_fld(wpath('wrong.f00001'), ids=np.roll(PA.elems['id'], 1), lx=4, ly=4, lz=4, wd=8, rdcode='UP')
+rc, out = tool('permute_fields.py', wpath('pbox.nmsh'), wpath('pbox7.nmsh'), '-o', wpath('pf_out'),
+               wpath('wrong.f00001'), '--force')
+report('permute_fields: an fld whose idx does not match the source mesh is refused',
+       rc != 0 and 'idx column' in out, out[-300:])
+with open(wpath('trunc.chkp'), 'wb') as f:
+    f.write(open(wpath('b.chkp'), 'rb').read()[:-100])
+rc, out = tool('permute_fields.py', wpath('pbox.nmsh'), wpath('pbox7.nmsh'), '-o', wpath('pf_out'),
+               wpath('trunc.chkp'), '--force')
+report('permute_fields: a checkpoint whose size fits no real kind is refused',
+       rc != 0 and 'real kind' in out, out[-300:])
+rc, _ = tool('genmeshbox.py', 0, 1, 0, 1, 0, 1, 6, 5, 3, wpath('other.nmsh'))
+rc, out = tool('permute_fields.py', wpath('pbox.nmsh'), wpath('other.nmsh'), '-o', wpath('pf_out'),
+               wpath('b.chkp'), '--force')
+report('permute_fields: two different meshes are refused', rc != 0, out[-300:])
+rc, out = tool('permute_fields.py', wpath('pbox.nmsh'), wpath('pbox7.nmsh'), '-o', WORK, wpath('b.chkp'))
+report('permute_fields: overwriting the input is refused', rc != 0 and 'overwrite' in out, out[-200:])
+GMF = os.path.join(HERE, 'tests', 'neko_fields')
+if os.path.isdir(GMF):
+    # real Neko output: a 4x4x4 periodic box run on the original mesh (1 rank)
+    # and on a prepart --grid 2,1,1 ordering (2 ranks); the t=0 field file
+    # is the pointwise user initial condition, so permuting the 1-rank file
+    # must give the 2-rank file byte for byte
+    os.makedirs(wpath('real_out'), exist_ok=True)
+    rc, out = tool('permute_fields.py', os.path.join(GMF, 'box64.nmsh'), os.path.join(GMF, 'box64_g211.nmsh'),
+                   '-o', wpath('real_out'), os.path.join(GMF, 'A', 'field0.f00000'),
+                   os.path.join(GMF, 'A', 'field0.f00001'), os.path.join(GMF, 'A', 'fluid00001.chkp'), '--force')
+    if rc == 0:
+        def block_diffs(perm_path, ref_path, unperm_path, layout):
+            """max |difference| per block, permuted vs the target run's own file, and
+            for the unpermuted source (which must be O(1) off)."""
+            a = np.memmap(perm_path, dtype=np.uint8, mode='r')
+            b = np.memmap(ref_path, dtype=np.uint8, mode='r')
+            u = np.memmap(unperm_path, dtype=np.uint8, mode='r')
+            out = {}
+            for blk in layout.blocks:
+                sa = bytes(a[blk.offset:blk.offset + blk.nbytes]); sb = bytes(b[blk.offset:blk.offset + blk.nbytes])
+                su = bytes(u[blk.offset:blk.offset + blk.nbytes])
+                if blk.rec_bytes == 0 or blk.name == 'idx':
+                    out[blk.name] = (0.0 if sa == sb else np.inf, 0.0 if su == sb else np.inf)
+                    continue
+                dt = '<f4' if 'min/max' in blk.name else '<f8'
+                fa, fb, fu = (np.frombuffer(x, dt).astype(np.float64) for x in (sa, sb, su))
+                out[blk.name] = (float(np.abs(fa - fb).max()), float(np.abs(fu - fb).max()))
+            return out
+        la = fld_layout(wpath('real_out/field0.f00000'))
+        d0 = block_diffs(wpath('real_out/field0.f00000'), os.path.join(GMF, 'B', 'field0.f00000'),
+                         os.path.join(GMF, 'A', 'field0.f00000'), la)
+        # t = 0: coordinates, pressure, idx and header identical; the velocity/curl
+        # blocks differ by the round-off of Neko's gather-scatter average of the IC
+        ok = d0['header'][0] == 0 and d0['idx'][0] == 0 and d0['X'][0] == 0 and d0['P'][0] == 0 \
+            and max(v[0] for v in d0.values()) < 1e-12 and d0['U'][1] > 0.1 and d0['X'][1] > 0.1
+        report('permute_fields: real Neko t=0 file (1-rank order -> 2-rank order): X, P, idx '
+               'identical, rest to 1e-12; unpermuted file is O(1) off', ok, str(d0))
+        la = fld_layout(wpath('real_out/field0.f00001'))
+        d1 = block_diffs(wpath('real_out/field0.f00001'), os.path.join(GMF, 'B', 'field0.f00001'),
+                         os.path.join(GMF, 'A', 'field0.f00001'), la)
+        ok = max(v[0] for v in d1.values()) < 1e-6 and d1['U'][1] > 0.1
+        report('permute_fields: real Neko step-5 field file agrees to solver tolerance (max diff '
+               '%.1e), unpermuted %.1e' % (max(v[0] for v in d1.values()), d1['U'][1]), ok, str(d1))
+        ca = chkp_layout(wpath('real_out/fluid00001.chkp'))
+        cb = chkp_layout(os.path.join(GMF, 'B', 'fluid00001.chkp'))
+        dc = block_diffs(wpath('real_out/fluid00001.chkp'), os.path.join(GMF, 'B', 'fluid00001.chkp'),
+                         os.path.join(GMF, 'A', 'fluid00001.chkp'), ca)
+        ok = ca.blocks == cb.blocks and max(v[0] for v in dc.values()) < 1e-6 and dc['u'][1] > 0.1 \
+            and dc['header'][0] == 0 and dc['tlag/dtlag'][0] == 0
+        report('permute_fields: real Neko checkpoint (%d blocks) agrees to solver tolerance (max '
+               'diff %.1e), unpermuted %.1e' % (len(ca.blocks), max(v[0] for v in dc.values()), dc['u'][1]),
+               ok, str(dc))
+    else:
+        report('permute_fields: real Neko files convert', False, out[-400:])
+else:
+    skip('permute_fields on real Neko output', 'tests/neko_fields not present')
+
 # ---- summary ---------------------------------------------------------------
 nfail = sum(1 for _, ok in RESULTS if not ok)
 print('\n%d checks, %d failed' % (len(RESULTS), nfail))

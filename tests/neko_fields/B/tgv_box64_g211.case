@@ -1,0 +1,65 @@
+{
+  "version": 1.0,
+  "case": {
+    "mesh_file": "box64_g211.nmsh",
+    "output_boundary": true,
+    "output_checkpoints": true,
+    "output_at_end": true,
+    "load_balancing": false,
+    "job_timelimit": "00:00:00",
+    "time": {
+      "end_time": 0.05,
+      "timestep": 0.01
+    },
+    "numerics": {
+      "time_order": 3,
+      "polynomial_order": 3,
+      "dealias": true
+    },
+    "fluid": {
+      "scheme": "pnpn",
+      "Re": 360.0,
+      "initial_condition": {
+        "type": "user"
+      },
+      "velocity_solver": {
+        "type": "cg",
+        "preconditioner": {
+          "type": "jacobi"
+        },
+        "projection_space_size": 0,
+        "absolute_tolerance": 1e-09,
+        "max_iterations": 800
+      },
+      "pressure_solver": {
+        "type": "gmres",
+        "preconditioner": {
+          "type": "hsmg"
+        },
+        "projection_space_size": 20,
+        "absolute_tolerance": 1e-07,
+        "max_iterations": 800
+      },
+      "output_control": "tsteps",
+      "output_value": 5
+    },
+    "simulation_components": [
+      {
+        "type": "curl",
+        "fields": [
+          "u",
+          "v",
+          "w"
+        ],
+        "name": "omega",
+        "computed_field": "omega",
+        "compute_control": "tsteps",
+        "compute_value": 1
+      }
+    ],
+    "output_directory": "F/",
+    "checkpoint_control": "tsteps",
+    "checkpoint_value": 5,
+    "output_precision": "double"
+  }
+}

@@ -13,7 +13,7 @@ sources next to them -- byte-exact where a Neko-written reference exists --
 without a Neko build, MPI or a Fortran compiler: `python3` with numpy is the
 only hard requirement (scipy for partitioning and periodic-zone creation).
 One shared library (`nekolight/`) holds every byte layout, topology table
-and algorithm exactly once; seven thin command-line tools sit on top of it.
+and algorithm exactly once; eight thin command-line tools sit on top of it.
 
 | Tool | What it does | Needs |
 |---|---|---|
@@ -23,6 +23,7 @@ and algorithm exactly once; seven thin command-line tools sit on top of it.
 | `prepart.py` | Mesh partitioner (spectral / METIS / geometric / grid) writing a reordered `.nmsh` whose linear read reproduces the partition exactly | numpy + scipy (optional: pymetis) |
 | `create_periodic_zones.py` | Turn pairs of labelled zones into periodic zones, as `contrib/create_periodic_zones` | numpy + scipy |
 | `gmsh2nmsh.py` | Gmsh `.msh` (2.2/4.1, ASCII/binary; hex or quad, first or second order) → `.nmsh`: `contrib/gmsh2nek` and Nek5000's `n2to3` in one step -- physical groups to labelled zones, `$Periodic` to periodic zones, mid-edge nodes to midside curves, optional extrusion of a 2D mesh into hexahedral layers with periodic or labelled z-faces | numpy (scipy for periodic matching) |
+| `permute_fields.py` | Reorder the elements of `.fld` field files and `.chkp` checkpoints from one mesh ordering to another (restart after re-partitioning): streaming record gather, exact copy of every value | numpy |
 | `meshview.py` | Interactive mesh viewer: external-surface extraction + PyVista, `.vtu` export for ParaView, matplotlib fallback, `--curved` | numpy (optional: pyvista, matplotlib) |
 
 All tools accept 2D (quad) as well as 3D (hex) meshes, exactly as Neko
@@ -264,6 +265,55 @@ same conventions:
 
 Test fixtures generated with the Gmsh Python API are in `tests/gmsh/`
 (`generate.py` recreates them).
+
+## Field and checkpoint files after re-partitioning
+
+`permute_fields.py SRC_MESH.nmsh DST_MESH.nmsh -o OUTDIR FILE [FILE ...]
+[--scratch DIR] [--chunk-mb 512] [--rp 4|8] [--match ids|centroids]`
+
+Neko places field (`name0.f00012`) and checkpoint (`.chkp`) data by element
+*position*: rank r owns the positions of its linear element distribution
+and the file holds the elements in the mesh file's order.  A run on a
+`prepart.py` output (or on Neko's own `<mesh>_lb_<ranks>.nmsh`) therefore
+cannot read files written on another ordering of the same mesh; the
+`initial_condition` `"field"` type copies element k of the file into element
+k of the mesh, and `restart_file` does the same.  `permute_fields.py` fixes
+the files instead of the run: it matches the elements of the two mesh files
+(by point ids, which `prepart` keeps, verified by corner coordinates; by
+centroids for files that do not share ids) and gathers the fixed-size
+per-element records of every block into the target order.  Nothing inside
+a record changes; headers, the `tlag/dtlag` block and the ALE tracker
+arrays are copied verbatim; the `idx` column of a field file receives the
+element ids of the target mesh; the `.nek5000` series index is copied.
+Field files of both precisions, with or without coordinates, 2D and 3D
+(with their min/max metadata) are handled; checkpoints with velocity lags,
+scalar, `tlag/dtlag`, AB terms, scalar lags and ALE blocks (the real kind is
+inferred from the file size, `--rp` for ALE files).  Every layout is checked
+against the file size before anything is written.
+
+A fluid restarted from a permuted checkpoint reproduces the un-permuted
+restart bit for bit: with the same mesh and polynomial order Neko copies
+the fields without its gather-scatter fix-up.  A scalar differs by
+round-off, because `scalar_pnpn_restart` re-applies the gather-scatter.  Do
+not combine the permuted files with `restart_mesh_file`: that switches Neko
+to a lossy point-search interpolation.  Verified with Neko itself
+(`tests/neko_fields/`): the Taylor-Green case run on the original mesh with
+one rank and on `prepart --grid 2,1,1` / spectral / `--grid 1,2,2`
+orderings with two and four ranks; permuting the one-rank files reproduces
+the other runs' own files to the iterative-solver tolerance (3e-14 on the
+512-element case, coordinates and pressure bit-identical at t = 0), and
+Neko restarted from a permuted checkpoint agrees with the restart from the
+run's own checkpoint to the same tolerance, while the unpermuted files are
+off by order one.
+
+Memory is one chunk: the source is memory-mapped and each output chunk
+gathers its records in ascending source order while the output is written
+sequentially, so a 41-million-element checkpoint is processed with a few
+hundred MB.  The scattered reads cost throughput on parallel file systems;
+`--scratch DIR` switches to two sequential passes through bucket files
+(scratch space of the file size).  The work is a pure byte permutation and
+would parallelise over disjoint destination ranges; a single process is
+I/O-bound already.
 
 ## Memory
 
