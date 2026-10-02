@@ -50,13 +50,36 @@ case file as "file_name": "permuted_field0.fld" (with "sample_index") or
 "restart_file": "permuted_fluid00001.chkp"; the copied .nek5000 index gets
 the prefixed template, so ParaView/VisIt open the permuted series.
 
-Memory: element matching needs about 40 bytes per element; the record
-gather two chunks (--chunk-mb) plus the page cache of the source file; the
-two-pass --scratch method three chunks (or the bucket size for blocks above
-512 chunks) and scratch space of the file size.
+Streaming: the records of a block are moved in chunks (--chunk-mb, 512
+MB) in one of two directions.  gather writes the output sequentially and
+reads the source records of each chunk in ascending order, one explicit
+read per contiguous run (runs closer than 64 kB share one vectored read);
+scatter reads the source sequentially and writes the records of each chunk
+to their destinations, one write per contiguous run.  A prepart ordering
+keeps the original ids increasing inside each block, so in the scatter
+direction a source chunk has at most one run per block -- megabytes at a
+time, which is what a parallel file system needs -- while the gather
+direction can degrade to runs of a few records.  For every record size
+the tool counts the reads and bytes of one direction and the writes of
+the other (--method auto, the default, takes the cheaper one, counting a
+call as one megabyte; the numbers are logged) and issues the run
+reads/writes from --threads (8) threads.  The two-pass --scratch DIR
+method (sequential I/O only, through at most 512 bucket files) remains
+for permutations whose runs are short in both directions.
+
+Memory: element matching is one sequential pass over each mesh (20 bytes
+per element and mesh: ids, a hash of the sorted point ids, a hash of the
+corner coordinates -- corners whose hashes agree need no second look),
+of which the ids (4 bytes per element and mesh) stay for the run; the
+record streaming two chunks (--chunk-mb) plus the permutation and its
+inverse (16 bytes per element); the two-pass --scratch method three chunks
+(or the bucket size for blocks above 512 chunks) and scratch space of the
+file size.  A 41.8-million-element file runs in about 2 GB.
 
 Usage:
-  permute_fields.py SRC_MESH.nmsh DST_MESH.nmsh -o OUTDIR [--prefix permuted_] FILE [FILE ...]
+  permute_fields.py SRC_MESH.nmsh DST_MESH.nmsh -o OUTDIR [--prefix permuted_]
+                    [--method auto|gather|scatter] [--threads 8] [--chunk-mb 512]
+                    [--scratch DIR] FILE [FILE ...]
   permute_fields.py old/512.nmsh new/512_96.nmsh -o new/ old/field0.f00000 old/fluid00003.chkp
       -> new/permuted_field0.f00000  new/permuted_fluid00003.chkp
   permute_fields.py old.nmsh new.nmsh -o new/ old/field0.nek5000 old/field0.f0000*
@@ -70,9 +93,10 @@ import time
 
 import numpy as np
 
-from nekolight import banner, iter_nmsh_elements, read_nmsh
-from nekolight.permute import (element_permutation, verify_corners,
-                               corner_mismatch, gather_records, bucket_records)
+from nekolight import banner, read_nmsh
+from nekolight.permute import (MeshKeys, element_permutation, verify_corners,
+                               corner_mismatch, gather_records, scatter_records,
+                               bucket_records, run_stats, inverse_permutation)
 from nekolight.fldchkp import fld_layout, chkp_layout, read_fld_idx
 
 
@@ -96,8 +120,15 @@ def parse_args():
                          "the names, which is refused when it would overwrite an input)")
     ap.add_argument('--chunk-mb', type=float, default=512.0,
                     help='working chunk per block in MB (default 512)')
+    ap.add_argument('--method', choices=('auto', 'gather', 'scatter'), default='auto',
+                    help='streaming direction: gather (sequential output, source read '
+                         'in runs), scatter (sequential source, output written in runs) '
+                         'or auto (the one with fewer, longer runs; default)')
+    ap.add_argument('--threads', type=int, default=8,
+                    help='concurrent run reads/writes per chunk (default 8)')
     ap.add_argument('--scratch', metavar='DIR',
-                    help='two-pass sequential method with bucket files in DIR')
+                    help='two-pass sequential method with bucket files in DIR '
+                         '(instead of --method)')
     ap.add_argument('--rp', type=int, choices=(4, 8), default=None,
                     help='real kind of the checkpoints (default: inferred '
                          'from the file size)')
@@ -110,11 +141,6 @@ def parse_args():
     ap.add_argument('--force', action='store_true',
                     help='overwrite existing output files')
     return ap.parse_args()
-
-
-def element_ids(path):
-    return np.concatenate([e['id'].astype(np.int64)
-                           for _, e in iter_nmsh_elements(path)])
 
 
 class CoordCheck:
@@ -196,6 +222,60 @@ def nek5000_members(path, outdir):
         if not os.path.exists(os.path.join(outdir, name)):
             missing.append(name)
     return missing
+
+
+def fmt_bytes(b):
+    for unit, div in (('GB', 2 ** 30), ('MB', 2 ** 20), ('kB', 2 ** 10)):
+        if b >= div:
+            return '%.1f %s' % (b / div, unit)
+    return '%d B' % b
+
+
+def choose_method(rec_bytes, names, nbytes, perm, chunk, ctx, args):
+    """Streaming direction for the record blocks of one size: --scratch
+    selects the bucket method, --method forces a direction, auto takes the
+    cheaper one (calls plus bytes, see run_stats).  The statistics are
+    logged once per record size and file."""
+    key = (rec_bytes, chunk)
+    if key not in ctx['stats']:
+        ctx['stats'][key] = run_stats(perm, rec_bytes, chunk)
+    st = ctx['stats'][key]
+    if args.scratch:
+        method = 'bucket'
+    elif args.method != 'auto':
+        method = args.method
+    else:
+        method = st['best']
+    log('        %s records (%s, %s): per block gather %d read(s) of %s, scatter %d '
+        'write(s) of %s -> %s'
+        % (fmt_bytes(rec_bytes), ', '.join(names), fmt_bytes(nbytes),
+           st['gather'][0], fmt_bytes(st['gather'][1] / max(1, st['gather'][0])),
+           st['scatter'][0], fmt_bytes(st['scatter'][1] / max(1, st['scatter'][0])), method))
+    if (method != 'bucket' and nbytes >= 2 ** 26 and st[method][0] > 1
+            and st[method][1] / st[method][0] < 2 ** 20 and not ctx['hinted']):
+        log('        hint: the runs are short; on a parallel file system the two-pass '
+            '--scratch DIR method (sequential I/O only, scratch space of the file size) '
+            'is likely faster')
+        ctx['hinted'] = True
+    return method
+
+
+def block_progress(block):
+    """A progress callback that logs every 10% of a block of 1 GB or more."""
+    if block.nbytes < 2 ** 30:
+        return None
+    state = {'next': 0.1, 'start': time.time()}
+
+    def prog(done, total):
+        frac = done / total
+        if frac >= state['next'] or done == total:
+            el = time.time() - state['start']
+            log('        %-10s %3d%%  %s  %s/s' % (block.name, int(100 * frac),
+                                                 fmt_bytes(frac * block.nbytes),
+                                                 fmt_bytes(frac * block.nbytes / max(el, 1e-9))))
+            while state['next'] <= frac:
+                state['next'] += 0.1
+    return prog
 
 
 def permute_file(path, out, perm, ctx, args):
@@ -292,21 +372,43 @@ def permute_file(path, out, perm, ctx, args):
         log('        note: %d stale byte(s) after the layout are dropped (Neko does '
             'not truncate output files it rewrites)' % lay.trailing)
     t0 = time.time()
-    src = np.memmap(path, dtype=np.uint8, mode='r')
+    chunk = int(args.chunk_mb * 2 ** 20)
+    groups = {}
+    for b in lay.blocks:
+        if b.rec_bytes and b is not idx_block:
+            groups.setdefault(b.rec_bytes, [[], 0])
+            groups[b.rec_bytes][0].append(b.name)
+            groups[b.rec_bytes][1] += b.nbytes
+    methods = {rec: choose_method(rec, names, nb, perm, chunk, ctx, args)
+               for rec, (names, nb) in groups.items()}
+    if 'scatter' in methods.values() and ctx['inv'] is None:
+        ctx['inv'] = inverse_permutation(perm)
     tmp = out + '.tmp'
     try:
-        with open(tmp, 'wb') as f:
+        with open(path, 'rb') as fsrc, open(tmp, 'wb') as f:
             for b in lay.blocks:
                 if b.rec_bytes == 0:
-                    f.write(bytes(src[b.offset:b.offset + b.nbytes]))
+                    fsrc.seek(b.offset)
+                    f.write(fsrc.read(b.nbytes))
                 elif b is idx_block:
                     ctx['dst_ids'].astype('<i4').tofile(f)
-                elif args.scratch:
-                    bucket_records(path, f, b.offset, b.rec_bytes, perm,
-                                   args.scratch, int(args.chunk_mb * 2 ** 20))
                 else:
-                    gather_records(src, f, b.offset, b.rec_bytes, perm,
-                                   int(args.chunk_mb * 2 ** 20))
+                    method = methods[b.rec_bytes]
+                    prog = block_progress(b)
+                    if method == 'bucket':
+                        bucket_records(path, f, b.offset, b.rec_bytes, perm,
+                                       args.scratch, chunk, progress=prog)
+                    elif method == 'scatter':
+                        scatter_records(path, f, b.offset, b.offset, b.rec_bytes, perm,
+                                        chunk, args.threads, progress=prog, inv=ctx['inv'])
+                    else:
+                        gather_records(path, f, b.offset, b.rec_bytes, perm, chunk,
+                                       args.threads, progress=prog)
+                if f.tell() != b.offset + b.nbytes:
+                    raise RuntimeError('block %s: %d bytes written instead of %d'
+                                       % (b.name, f.tell() - b.offset, b.nbytes))
+            f.flush()
+            os.fsync(f.fileno())
         if os.path.getsize(tmp) != lay.size:
             raise RuntimeError('output size mismatch')
         os.replace(tmp, out)
@@ -344,24 +446,30 @@ def main():
         outs.append(out)
     if args.scratch and not os.path.isdir(args.scratch):
         sys.exit('Error: scratch directory %s does not exist' % args.scratch)
+    if args.threads < 1:
+        sys.exit('Error: --threads must be at least 1')
     log('  [1/3] matching the elements of the two meshes ...')
     t0 = time.time()
-    perm = element_permutation(args.src_mesh, args.dst_mesh, args.match, args.tol, log)
-    worst, nbad, scale = verify_corners(args.src_mesh, args.dst_mesh, perm)
+    keys = (MeshKeys(args.src_mesh), MeshKeys(args.dst_mesh))
+    log('        meshes read (%.1f s)' % (time.time() - t0))
+    perm = element_permutation(args.src_mesh, args.dst_mesh, args.match, args.tol, log, keys)
+    worst, nbad, scale = verify_corners(args.src_mesh, args.dst_mesh, perm, keys=keys)
     if nbad and args.match == 'ids':
         log('        note: %d element(s) matched by point ids have different '
             'corners; matching by centroids instead' % nbad)
-        perm = element_permutation(args.src_mesh, args.dst_mesh, 'centroids', args.tol, log)
-        worst, nbad, scale = verify_corners(args.src_mesh, args.dst_mesh, perm)
+        perm = element_permutation(args.src_mesh, args.dst_mesh, 'centroids', args.tol, log,
+                                   keys)
+        worst, nbad, scale = verify_corners(args.src_mesh, args.dst_mesh, perm, keys=keys)
     if nbad:
         sys.exit('Error: the two meshes do not hold the same elements: %d matched '
                  'element(s) have different corners (largest mismatch %.3e)' % (nbad, worst))
     moved = int((perm != np.arange(perm.size)).sum())
     log('        %d elements, %d change position, corners agree to %.1e  (%.1f s)'
         % (perm.size, moved, worst, time.time() - t0))
-    src_ids = element_ids(args.src_mesh)
-    dst_ids = element_ids(args.dst_mesh)
+    src_ids, dst_ids = keys[0].ids, keys[1].ids
+    del keys
     ctx = dict(src_ids=src_ids, dst_ids=dst_ids, fld_checked=False, chkp_warned=False,
+               stats={}, hinted=False, inv=None,
                               ids_trivial=bool(np.array_equal(src_ids, np.arange(1, perm.size + 1))
                                 and np.array_equal(dst_ids, np.arange(1, perm.size + 1))))
     log('  [2/3] permuting %d file(s) -> %s' % (len(args.files), args.outdir))

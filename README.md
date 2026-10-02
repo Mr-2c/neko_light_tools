@@ -269,8 +269,8 @@ Test fixtures generated with the Gmsh Python API are in `tests/gmsh/`
 ## Field and checkpoint files after re-partitioning
 
 `permute_fields.py SRC_MESH.nmsh DST_MESH.nmsh -o OUTDIR FILE [FILE ...]
-[--prefix permuted_] [--scratch DIR] [--chunk-mb 512] [--rp 4|8]
-[--match ids|centroids]`
+[--prefix permuted_] [--method auto|gather|scatter] [--threads 8]
+[--chunk-mb 512] [--scratch DIR] [--rp 4|8] [--match ids|centroids]`
 
 Neko places field (`name0.f00012`) and checkpoint (`.chkp`) data by element
 *position*: rank r owns the positions of its linear element distribution
@@ -315,16 +315,41 @@ Neko restarted from a permuted checkpoint agrees with the restart from the
 run's own checkpoint to the same tolerance, while the unpermuted files are
 off by order one.
 
-Memory: matching the two meshes costs about 40 bytes per element (hashed
-point-id keys; a KD-tree of centroids for `--match centroids`) plus the
-page cache of the mesh files; the record gather holds two chunks
-(`--chunk-mb`, default 512 MB) and lets the operating system cache the
-memory-mapped source, so a 41-million-element checkpoint is processed with
-about 2 GB of process memory.  The scattered reads cost throughput on
-parallel file systems; `--scratch DIR` switches to two sequential passes
-through at most 512 bucket files (three chunks of memory, scratch space of
-the file size).  The work is a pure byte permutation and would parallelise
-over disjoint destination ranges; a single process is I/O-bound already.
+Streaming: the records of a block are moved in chunks (`--chunk-mb`,
+default 512 MB) in one of two directions.  *gather* writes the output
+sequentially and reads the source records of each chunk in ascending
+order, one explicit read per contiguous run (runs closer than 64 kB share
+one vectored read); *scatter* reads the source sequentially and writes the
+records of each chunk to their destinations, one write per contiguous run.
+A `prepart` ordering keeps the original ids increasing inside each block,
+so in the scatter direction a source chunk has at most one run per block:
+for a layer-major extruded mesh of 41.8 million elements cut into 48
+x-slabs that is 48 runs of about 12 MB per 512 MB chunk, while the gather
+direction degrades to runs of a few records (kilobytes), which no file
+system serves quickly.  For every record size the tool counts the reads
+and bytes of one direction and the writes of the other and takes the
+cheaper one, counting a call as one megabyte of transfer (`--method auto`;
+the numbers are logged), issues the run reads/writes from `--threads`
+(default 8) threads, and logs progress every 10% of a block of 1 GB or
+more.  For permutations whose runs are short in both directions,
+`--scratch DIR` switches to two sequential passes through at most 512
+bucket files (three chunks of memory, scratch space of the file size);
+the tool prints a hint when that applies.  On Lustre, give the output
+directory a wide stripe before writing a file of hundreds of GB (`lfs
+setstripe -c -1 OUTDIR` or a stripe count of your choice): the output is
+created there and inherits the directory's layout.
+
+Memory and passes: matching the two meshes is one sequential pass over
+each (element ids, a hash of the sorted point ids and a hash of the corner
+coordinate bits: 24 bytes per element and mesh; corners whose hashes agree
+need no second look, which is every element of a `prepart` or Neko `_lb_`
+mesh, and only the others are read again and compared within a
+tolerance); a KD-tree of centroids serves `--match centroids`.  The record
+streaming holds two chunks plus the permutation and its inverse (16 bytes
+per element) and the element ids of both meshes (8 bytes per element), so
+a 41-million-element file is processed with about 2 GB of process memory.  The work is a pure byte permutation and
+would parallelise over disjoint source ranges; a single process with
+threaded I/O is file-system-bound already.
 Besides the element match, the tool checks a field file's `idx` column
 against the source mesh's element ids and, when the file carries
 coordinates, its element corners against the source mesh: they must

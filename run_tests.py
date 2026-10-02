@@ -1402,6 +1402,65 @@ ref_f = check_permuted(wpath('f3d.f00001'), wpath('pf_out/permuted_f3d.f00001'),
 report('permute_fields: two-pass --scratch method gives the same files, tiny chunks',
        rc == 0 and ref_a and ref_f and not [x for x in os.listdir(WORK) if x.startswith('bucket_')],
        out[-300:])
+# element matching reads each mesh once: an exact hash of the corner coordinates accepts the match
+# without a second pass; elements whose hashes differ are compared within the tolerance
+from nekolight.permute import MeshKeys, verify_corners   # noqa: E402
+kA, kB = MeshKeys(wpath('pbox.nmsh')), MeshKeys(wpath('pbox7.nmsh'))
+report('permute: prepart output has bit-identical corners (hash fast path, no second pass)',
+       np.array_equal(kA.xyzhash[perm], kB.xyzhash) and np.array_equal(kA.ids, np.arange(1, NE + 1))
+       and verify_corners(wpath('pbox.nmsh'), wpath('pbox7.nmsh'), perm, keys=(kA, kB)) == (0.0, 0, 0.0))
+el = PB.elems.copy(); el['v']['xyz'] += 1e-13
+write_nmsh(wpath('pert.nmsh'), el, (PB.zones,), PB.curves)
+kP = MeshKeys(wpath('pert.nmsh'))
+w, nb, sc = verify_corners(wpath('pbox.nmsh'), wpath('pert.nmsh'), perm, keys=(kA, kP))
+rc, out = tool('permute_fields.py', wpath('pbox.nmsh'), wpath('pert.nmsh'), '-o', wpath('pf_out'),
+               wpath('b.chkp'), '--force', '--prefix', 'pert_')
+report('permute: corners perturbed by 1e-13 (no hash match) pass the tolerance check (%.1e) and convert' % w,
+       not np.array_equal(kA.xyzhash[perm], kP.xyzhash) and nb == 0 and 0 < w < 1e-11 and rc == 0
+       and open(wpath('pf_out/pert_b.chkp'), 'rb').read() == open(wpath('pf_out/permuted_b.chkp'), 'rb').read(),
+       out[-300:])
+el = PB.elems.copy(); el['v'] = np.roll(el['v'], 3, axis=1)
+write_nmsh(wpath('rot.nmsh'), el, (PB.zones,), PB.curves)
+kR = MeshKeys(wpath('rot.nmsh'))
+report('permute: the corner hashes do not depend on the corner order inside an element',
+       np.array_equal(kR.xyzhash, kB.xyzhash) and np.array_equal(kR.idhash, kB.idhash))
+el = PB.elems.copy(); el['v']['xyz'][5, 2, 0] += 0.3
+write_nmsh(wpath('moved.nmsh'), el, (PB.zones,), PB.curves)
+rc, out = tool('permute_fields.py', wpath('pbox.nmsh'), wpath('moved.nmsh'), '-o', wpath('pf_out'),
+               wpath('b.chkp'), '--force', '--prefix', 'moved_')
+report('permute_fields: a mesh with one moved corner is refused', rc != 0 and 'no counterpart' in out, out[-300:])
+# the streaming directions: gather (sequential output, source read in runs), scatter (sequential
+# source, output written in runs), auto; identical bytes whatever the chunk and thread count
+from nekolight.permute import run_stats, _runs   # noqa: E402
+k0, L = _runs(np.array([3, 4, 5, 9, 10, 20]))
+report('permute: contiguous runs of sorted positions', k0.tolist() == [0, 3, 5] and L.tolist() == [3, 2, 1])
+ref_bytes = {n: open(wpath('pf_out/permuted_' + n), 'rb').read() for n in ('a.chkp', 'f3d.f00001')}
+for method, extra in (('gather', ['--threads', '1']), ('scatter', ['--threads', '3']),
+                      ('gather', ['--chunk-mb', '0.004']), ('scatter', ['--chunk-mb', '0.004', '--threads', '1'])):
+    rc, out = tool('permute_fields.py', wpath('pbox.nmsh'), wpath('pbox7.nmsh'), '-o', wpath('pf_out'),
+                   wpath('a.chkp'), wpath('f3d.f00001'), '--force', '--prefix', method + '_', '--method', method, *extra)
+    same = rc == 0 and all(open(wpath('pf_out/%s_%s' % (method, n)), 'rb').read() == ref_bytes[n] for n in ref_bytes)
+    report('permute_fields: --method %s %s gives the same bytes as the default' % (method, ' '.join(extra)),
+           same and ('-> ' + method) in out, out[-300:])
+rc, out = tool('permute_fields.py', wpath('pbox.nmsh'), wpath('pbox7.nmsh'), '-o', wpath('pf_out'),
+               wpath('a.chkp'), '--force', '--threads', '0')
+report('permute_fields: --threads 0 is refused', rc != 0 and 'threads' in out, out[-200:])
+# a layer-major extruded mesh re-ordered into x-slabs (the structure prepart --grid produces): the
+# scatter direction has at most one run per slab and source chunk, gather runs of a few records
+nx, ny, nz, P = 96, 50, 20, 48
+n_lm = nx * ny * nz
+slab = np.tile(np.arange(nx), ny * nz) * P // nx
+perm_lm = np.lexsort((np.arange(n_lm), slab)).astype(np.int64)
+st = run_stats(perm_lm, 4116, 1 << 26)
+nchunks = -(-n_lm // ((1 << 26) // 4116))
+report('permute: run statistics of a layer-major -> x-slab ordering: scatter <= slabs * chunks writes '
+       '(%d <= %d), gather %d reads -> scatter' % (st['scatter'][0], P * nchunks, st['gather'][0]),
+       st['scatter'][0] <= P * nchunks and st['gather'][0] > 20 * st['scatter'][0]
+       and st['scatter'][1] == n_lm * 4116 and st['best'] == 'scatter')
+st8 = run_stats(np.random.default_rng(5).permutation(200000).astype(np.int64), 8, 1 << 20)
+report('permute: tiny records with a random permutation: gather bridges the gaps (%d reads) and wins '
+       'over scatter (%d writes)' % (st8['gather'][0], st8['scatter'][0]),
+       st8['best'] == 'gather' and st8['gather'][0] < st8['scatter'][0] / 50)
 # error paths
 write_fld(wpath('wrong.f00001'), ids=np.roll(PA.elems['id'], 1), lx=4, ly=4, lz=4, wd=8, rdcode='UP')
 rc, out = tool('permute_fields.py', wpath('pbox.nmsh'), wpath('pbox7.nmsh'), '-o', wpath('pf_out'),
