@@ -42,14 +42,23 @@ identity at all: for them the source mesh is taken on trust, so give a
 coordinate-carrying field file of the same run in the same call when in
 doubt.
 
+Output names: every file is written as PREFIX + its name (--prefix,
+default 'permuted_'), so an input is never overwritten and the two
+orderings cannot be confused.  Neko builds a series' file names from the
+base name, so the prefix keeps the files loadable: refer to them in the
+case file as "file_name": "permuted_field0.fld" (with "sample_index") or
+"restart_file": "permuted_fluid00001.chkp"; the copied .nek5000 index gets
+the prefixed template, so ParaView/VisIt open the permuted series.
+
 Memory: element matching needs about 40 bytes per element; the record
 gather two chunks (--chunk-mb) plus the page cache of the source file; the
 two-pass --scratch method three chunks (or the bucket size for blocks above
 512 chunks) and scratch space of the file size.
 
 Usage:
-  permute_fields.py SRC_MESH.nmsh DST_MESH.nmsh -o OUTDIR FILE [FILE ...]
+  permute_fields.py SRC_MESH.nmsh DST_MESH.nmsh -o OUTDIR [--prefix permuted_] FILE [FILE ...]
   permute_fields.py old/512.nmsh new/512_96.nmsh -o new/ old/field0.f00000 old/fluid00003.chkp
+      -> new/permuted_field0.f00000  new/permuted_fluid00003.chkp
   permute_fields.py old.nmsh new.nmsh -o new/ old/field0.nek5000 old/field0.f0000*
 """
 import argparse
@@ -81,7 +90,10 @@ def parse_args():
     ap.add_argument('files', nargs='+', help='.fld / name0.f00012 / .chkp / '
                     '.nek5000 files (the .nek5000 series index is copied)')
     ap.add_argument('-o', '--outdir', required=True,
-                    help='output directory (files keep their names)')
+                    help='output directory (files are written as PREFIX + name)')
+    ap.add_argument('--prefix', default='permuted_',
+                    help="prefix of the output names (default permuted_; '' keeps "
+                         "the names, which is refused when it would overwrite an input)")
     ap.add_argument('--chunk-mb', type=float, default=512.0,
                     help='working chunk per block in MB (default 512)')
     ap.add_argument('--scratch', metavar='DIR',
@@ -190,8 +202,17 @@ def permute_file(path, out, perm, ctx, args):
     name = os.path.basename(path)
     low = name.lower()
     if low.endswith('.nek5000'):
-        shutil.copyfile(path, out)
-        log('  %-40s copied (series index)' % name)
+        txt = open(path).read()
+        m = re.search(r'^(\s*filetemplate:\s*)(\S+)', txt, flags=re.M)
+        if m and args.prefix:
+            tmpl = os.path.join(os.path.dirname(m.group(2)),
+                                args.prefix + os.path.basename(m.group(2)))
+            txt = txt[:m.start(2)] + tmpl + txt[m.end(2):]
+        else:
+            tmpl = m.group(2) if m else '?'
+        with open(out, 'w') as f:
+            f.write(txt)
+        log('  %-40s series index -> %s (template %s)' % (name, os.path.basename(out), tmpl))
         return
     if low.endswith('.chkp'):
         lay = chkp_layout(path, args.rp)
@@ -222,10 +243,13 @@ def permute_file(path, out, perm, ctx, args):
                     'identity: such a file cannot be permuted)')
             sys.exit('Error: %s: its idx column does not hold the element ids of '
                      '%s -- %s' % (path, args.src_mesh, hint))
-        if ctx['ids_trivial'] and not ctx['ids_noted']:
-            log('        note: both meshes number their elements 1..N, so the idx '
-                'column cannot tell the two orderings apart')
-            ctx['ids_noted'] = True
+        if ctx['ids_trivial']:
+            log('        idx column holds the source mesh element ids (trivially: both '
+                'meshes number their elements 1..N, so this check cannot catch '
+                'swapped mesh arguments)')
+        else:
+            log('        idx column holds the element ids of %s'
+                % os.path.basename(args.src_mesh))
         if 'X' in lay.rdcode:
             r = check_fld_coordinates(path, lay, args.src_mesh,
                                       max(1, int(args.chunk_mb * 2 ** 20)
@@ -255,6 +279,15 @@ def permute_file(path, out, perm, ctx, args):
                          % (path, args.src_mesh, r.abs_nbad, r.abs_worst, r.con_worst,
                             r.con_nshared))
             ctx['fld_checked'] = True
+        elif ctx['fld_checked']:
+            log('        no coordinates in this file; the coordinate check of the field '
+                'file(s) above covers this run')
+        else:
+            m = re.match(r'^(.*\.f)\d{5}$', name)
+            log('        note: this file carries no coordinates, so the source mesh '
+                'ordering is taken on trust; give the coordinate-carrying file of the '
+                'series (usually the first, %s) in the same call to verify it'
+                % ('e.g. ' + m.group(1) + '00000' if m else 'with X in its rdcode'))
     if lay.trailing:
         log('        note: %d stale byte(s) after the layout are dropped (Neko does '
             'not truncate output files it rewrites)' % lay.trailing)
@@ -300,7 +333,7 @@ def main():
     for p in args.files:
         if not os.path.isfile(p):
             sys.exit('Error: %s not found' % p)
-        out = os.path.join(args.outdir, os.path.basename(p))
+        out = os.path.join(args.outdir, args.prefix + os.path.basename(p))
         if os.path.realpath(out) == os.path.realpath(p) or (
                 os.path.exists(out) and os.path.samefile(out, p)):
             sys.exit('Error: %s would overwrite the input (choose another -o)' % p)
@@ -329,14 +362,21 @@ def main():
     src_ids = element_ids(args.src_mesh)
     dst_ids = element_ids(args.dst_mesh)
     ctx = dict(src_ids=src_ids, dst_ids=dst_ids, fld_checked=False, chkp_warned=False,
-               ids_noted=False,
-               ids_trivial=bool(np.array_equal(src_ids, np.arange(1, perm.size + 1))
+                              ids_trivial=bool(np.array_equal(src_ids, np.arange(1, perm.size + 1))
                                 and np.array_equal(dst_ids, np.arange(1, perm.size + 1))))
     log('  [2/3] permuting %d file(s) -> %s' % (len(args.files), args.outdir))
     # coordinate-carrying field files first: they validate the source mesh
+    def has_coords(p):
+        low = p.lower()
+        if low.endswith('.chkp') or low.endswith('.nek5000'):
+            return False
+        with open(p, 'rb') as f:
+            return b'X' in f.read(132)[83:93]
+
     order = sorted(range(len(args.files)),
                    key=lambda i: (args.files[i].lower().endswith('.chkp'),
-                                  args.files[i].lower().endswith('.nek5000')))
+                                  args.files[i].lower().endswith('.nek5000'),
+                                  not has_coords(args.files[i])))
     for i in order:
         permute_file(args.files[i], outs[i], perm, ctx, args)
     for p, out in zip(args.files, outs):
@@ -348,8 +388,10 @@ def main():
                     'the series' % (os.path.basename(out), len(missing), args.outdir,
                                      missing[0]))
     log('  [3/3] done')
-    log('  Restart the target run with the permuted files as usual (no '
-        'restart_mesh_file: that would interpolate instead of copying).')
+    log('  Point the target run at the permuted files as usual, e.g. "restart_file": '
+        '"%sfluid00001.chkp" or "initial_condition": {"type": "field", "file_name": '
+        '"%sfield0.fld", "sample_index": N}; no restart_mesh_file (that would '
+        'interpolate instead of copying).' % (args.prefix, args.prefix))
 
 
 if __name__ == '__main__':

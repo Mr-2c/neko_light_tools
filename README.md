@@ -269,7 +269,8 @@ Test fixtures generated with the Gmsh Python API are in `tests/gmsh/`
 ## Field and checkpoint files after re-partitioning
 
 `permute_fields.py SRC_MESH.nmsh DST_MESH.nmsh -o OUTDIR FILE [FILE ...]
-[--scratch DIR] [--chunk-mb 512] [--rp 4|8] [--match ids|centroids]`
+[--prefix permuted_] [--scratch DIR] [--chunk-mb 512] [--rp 4|8]
+[--match ids|centroids]`
 
 Neko places field (`name0.f00012`) and checkpoint (`.chkp`) data by element
 *position*: rank r owns the positions of its linear element distribution
@@ -286,7 +287,13 @@ the fixed-size per-element records of every block into the target order.
 Nothing inside
 a record changes; headers, the `tlag/dtlag` block and the ALE tracker
 arrays are copied verbatim; the `idx` column of a field file receives the
-element ids of the target mesh; the `.nek5000` series index is copied.
+element ids of the target mesh.  Every output is written as
+`permuted_<name>` (`--prefix`), so an input is never overwritten and the two
+orderings cannot be confused; Neko builds a series' file names from the
+base name, so the files stay loadable as `"file_name": "permuted_field0.fld"`
+with `"sample_index"`, or `"restart_file": "permuted_fluid00001.chkp"`, and
+the `.nek5000` series index is rewritten with the prefixed template so
+ParaView/VisIt open the permuted series.
 Field files of both precisions, with or without coordinates, 2D and 3D
 (with their min/max metadata) are handled; checkpoints with velocity lags,
 scalar, `tlag/dtlag`, AB terms, scalar lags and ALE blocks (the real kind is
